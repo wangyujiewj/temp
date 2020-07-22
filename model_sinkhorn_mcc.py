@@ -329,9 +329,6 @@ class Transformer(nn.Module):
         src_embedding = self.model(tgt, src, None, None).transpose(2, 1).contiguous()
         return src_embedding, tgt_embedding
 
-def arange_like(x, dim: int):
-    return x.new_ones(x.shape[dim]).cumsum(0) - 1
-
 def log_sinkhorn_iterations(Z, log_mu, log_nu, iters: int):
     """ Perform Sinkhorn Normalization in Log-space for stability"""
     u, v = torch.zeros_like(log_mu), torch.zeros_like(log_nu)
@@ -340,24 +337,18 @@ def log_sinkhorn_iterations(Z, log_mu, log_nu, iters: int):
         v = log_nu - torch.logsumexp(Z + u.unsqueeze(2), dim=1)
     return Z + u.unsqueeze(2) + v.unsqueeze(1)
 
-def log_optimal_transport(scores, alpha, iters=20):
+def log_optimal_transport(scores, iters=100):
     b, m, n = scores.shape
     one = scores.new_tensor(1)
     # 维度的tensor形式
     ms, ns = (m * one).to(scores), (n * one).to(scores)
-    bins0 = alpha.expand(b, m, 1)
-    bins1 = alpha.expand(b, 1, n)
-    alpha = alpha.expand(b, 1, 1)
-    # (bs, m+1, n+1)
-    couplings = torch.cat([torch.cat([scores, bins0], -1),
-                           torch.cat([bins1, alpha], -1)], 1)
     norm = - (ms + ns).log()
-    log_mu = torch.cat([norm.expand(m), ns.log()[None] + norm])
-    log_nu = torch.cat([norm.expand(n), ms.log()[None] + norm])
+    log_mu = norm.expand(m)
+    log_nu = norm.expand(n)
     log_mu, log_nu = log_mu[None].expand(b, -1), log_nu[None].expand(b, -1)
-    Z = log_sinkhorn_iterations(couplings, log_mu, log_nu, iters)
+    Z = log_sinkhorn_iterations(scores, log_mu, log_nu, iters)
     Z = Z - norm
-    return Z[:, :-1, :-1]
+    return Z
 
 
 class SVDHead(nn.Module):
@@ -367,6 +358,9 @@ class SVDHead(nn.Module):
         self.reflect = nn.Parameter(torch.eye(3), requires_grad=False)
         self.reflect[2, 2] = -1
         self.my_iter = torch.ones(1)
+        self.sink_iters = 100
+        bin_score = torch.nn.Parameter(torch.tensor(1.))
+        self.register_parameter('bin_score', bin_score)
 
     def forward(self, *input):
         src_embedding = input[0]
@@ -379,10 +373,8 @@ class SVDHead(nn.Module):
         temperature = input[4].view(batch_size, 1, 1)
         # (bs, k, np)
         scores = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
-        scores = scores.view(batch_size * num_points_k, num_points)
-        temperature = temperature.repeat(1, num_points_k, 1).view(-1, 1)
-        scores = F.gumbel_softmax(scores, tau=temperature, hard=True)
-        scores = scores.view(batch_size, num_points_k, num_points)
+        scores = log_optimal_transport(scores=scores)
+        scores = scores.exp()
         src_corr = torch.matmul(tgt, scores.transpose(2, 1).contiguous())
         # (bs, np)
         TD = torch.sum((src - src_corr) ** 2, dim=1)
@@ -458,7 +450,7 @@ class MatchNet(nn.Module):
             gss = GSS(args)
             self.add_module('emb_nn_{}'.format(i), layer)
             self.add_module('attention_{}'.format(i), attn)
-            # self.add_module('sampling_{}'.format(i), gss)
+            self.add_module('sampling_{}'.format(i), gss)
         self.head = SVDHead(args=args)
     def forward(self, *input):
         src = input[0]
@@ -473,8 +465,8 @@ class MatchNet(nn.Module):
         src_embedding_p, tgt_embedding_p = attn(src_embedding, tgt_embedding)
         src_embedding = src_embedding + src_embedding_p
         tgt_embedding = tgt_embedding + tgt_embedding_p
-        # sampling = getattr(self, 'sampling_{}'.format(i))
-        # src_embedding, src = sampling(src_embedding, src, temp)
+        sampling = getattr(self, 'sampling_{}'.format(i))
+        src_embedding, src = sampling(src_embedding, src, temp)
         rotation_ab, translation_ab = self.head(src_embedding, tgt_embedding, src, tgt, temp, sigma)
         return rotation_ab, translation_ab
 
@@ -517,7 +509,7 @@ class HMNet(nn.Module):
             meanDist = torch.mean(median)
             sigmal_ = meanDist * self.sigma_times
             sigmal_ = sigmal_.repeat(batch_size)
-            gamma_ = epoch / self.epochs
+            gamma_ = float(epoch / self.epochs)
         for i in range(self.num_iters):
             sigmal_ = sigmal_ * self.DecayPram
             rotation_ab_pred_i, translation_ab_pred_i = self.forward(src, tgt, temp, i, sigmal_)
@@ -526,10 +518,10 @@ class HMNet(nn.Module):
                                   + translation_ab_pred_i
             mcc_loss = self.mcc_loss(src, rotation_ab_pred, translation_ab_pred, rotation_ab, translation_ab,
                                      sigmal_)
-            mse_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity) \
-                        + F.mse_loss(translation_ab_pred, translation_ab))
-            loss = mcc_loss * gamma_ + mse_loss * (1 - gamma_)
-            total_loss = total_loss + loss * self.discount_factor ** i
+            # mse_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity) \
+            #             + F.mse_loss(translation_ab_pred, translation_ab))
+            # loss = mcc_loss * gamma_ + mse_loss * (1 - gamma_)
+            total_loss = total_loss + mcc_loss * self.discount_factor ** i
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         total_loss.backward()
         opt.step()
@@ -551,7 +543,7 @@ class HMNet(nn.Module):
         sigmal_ = meanDist * self.sigma_times
         self.sigma_ = sigmal_.item()
         sigmal_ = sigmal_.repeat(batch_size)
-        gamma_ = epoch / self.epochs
+        gamma_ = float(epoch / self.epochs)
         for i in range(self.num_iters):
             sigmal_ = sigmal_ * self.DecayPram
             rotation_ab_pred_i, translation_ab_pred_i = self.forward(src, tgt, temp, i, sigmal_)
@@ -560,10 +552,10 @@ class HMNet(nn.Module):
                                   + translation_ab_pred_i
             mcc_loss = self.mcc_loss(src, rotation_ab_pred, translation_ab_pred, rotation_ab, translation_ab,
                                  sigmal_)
-            mse_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity) \
-                    + F.mse_loss(translation_ab_pred, translation_ab))
-            loss = mcc_loss * gamma_ + mse_loss * (1 - gamma_)
-            total_loss = total_loss + loss * self.discount_factor ** i
+            # mse_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity) \
+            #         + F.mse_loss(translation_ab_pred, translation_ab))
+            # loss = mcc_loss * gamma_ + mse_loss * (1 - gamma_)
+            total_loss = total_loss + mcc_loss * self.discount_factor ** i
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         return total_loss.item(), rotation_ab_pred, translation_ab_pred
 
@@ -580,7 +572,7 @@ class HMNet(nn.Module):
             src, tgt, rotation_ab, translation_ab, rotation_ba, translation_ba, euler_ab, euler_ba = [d.cuda()
                                                                                                       for d in data]
             loss, rotation_ab_pred, translation_ab_pred = self._train_one_batch(src, tgt, rotation_ab, translation_ab,
-                                                                                opt, temp,epoch)
+                                                                                opt, temp, epoch)
             batch_size = src.size(0)
             num_examples += batch_size
             total_loss = total_loss + loss * batch_size
@@ -633,7 +625,7 @@ class HMNet(nn.Module):
             src, tgt, rotation_ab, translation_ab, rotation_ba, translation_ba, euler_ab, euler_ba = [d.cuda()
                                                                                                       for d in data]
             loss, rotation_ab_pred, translation_ab_pred = self._test_one_batch(src, tgt, rotation_ab, translation_ab,
-                                                                               temp)
+                                                                               temp, epoch)
             batch_size = src.size(0)
             num_examples += batch_size
             total_loss = total_loss + loss * batch_size
