@@ -355,35 +355,21 @@ class SVDHead(nn.Module):
         scores = F.gumbel_softmax(scores, tau=temperature, hard=True)
         scores = scores.view(batch_size, num_points_k, num_points)
         src_corr = torch.matmul(tgt, scores.transpose(2, 1).contiguous())
-        # (bs, np)
-        TD = torch.sum((src - src_corr) ** 2, dim=1)
-        # (bs, np, 1)
-        G = torch.exp(-TD / (2 * sigma ** 2)).unsqueeze(-1)
-        # (bs, 1, 1)
-        sum_G = torch.sum(G, dim=1, keepdim=True)
-        # (bs, 3, 1)
-        mX = torch.matmul(src, G) / sum_G
-        mY = torch.matmul(src_corr, G) / sum_G
-        # (bs, 3, np)
-        Xshifted = src - mX
-        Yshifted = src_corr - mY
-        Xshifted = torch.mul(G.transpose(2, 1), Xshifted)
-        # (bs, 3, 3)
-        K = torch.matmul(Xshifted, Yshifted.transpose(2, 1))
-        K = -(sigma.unsqueeze(-1)) ** (-2) * K / num_points
+        src_centered = src - src.mean(dim=2, keepdim=True)
+        src_corr_centered = src_corr - src_corr.mean(dim=2, keepdim=True)
+        H = torch.matmul(src_centered, src_corr_centered.transpose(2, 1).contiguous()).cpu()
         R = []
         for i in range(src.size(0)):
-            u, s, v = torch.svd(K[i])
+            u, s, v = torch.svd(H[i])
             r = torch.matmul(v, u.transpose(1, 0)).contiguous()
-            # r_det = torch.det(r).item()
+            r_det = torch.det(r).item()
             diag = torch.from_numpy(np.array([[1.0, 0, 0],
                                               [0, 1.0, 0],
-                                              [0, 0, 1.0]]).astype('float32')).to(v.device)
-            r = torch.matmul(r, -diag)
-            # r = torch.matmul(torch.matmul(v, diag), u.transpose(1, 0)).contiguous()
+                                              [0, 0, r_det]]).astype('float32')).to(v.device)
+            r = torch.matmul(torch.matmul(v, diag), u.transpose(1, 0)).contiguous()
             R.append(r)
         R = torch.stack(R, dim=0).cuda()
-        t = torch.matmul(-torch.matmul(R, src) + src_corr, G) / sum_G
+        t = torch.matmul(-R, src.mean(dim=2, keepdim=True)) + src_corr.mean(dim=2, keepdim=True)
         if self.training:
             self.my_iter += 1
         return R, t.view(batch_size, 3)
