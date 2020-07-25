@@ -432,6 +432,25 @@ class MatchNet(nn.Module):
         rotation_ab, translation_ab = self.head(src_embedding_k, tgt_embedding, src_k, tgt, temp)
         return rotation_ab, translation_ab, sample_scores
 
+def compute_scores_gt(sampling_scores, src, tgt, rotation_ab, translation_ab):
+    bs, k, num_points = sampling_scores.size()
+    src_corr = transform_point_cloud(src, rotation_ab, translation_ab)
+    inner = -2 * torch.matmul(src_corr.transpose(2, 1).contiguous(), tgt)
+    xx = torch.sum(src_corr ** 2, dim=1, keepdim=True)
+    yy = torch.sum(tgt ** 2, dim=1, keepdim=True)
+    distance = xx.transpose(2, 1).contiguous() + inner + yy
+    nearst_dist, _ = distance.sort(dim=-1)
+    # (bs, np)
+    nearst_dist = nearst_dist[:, :, 0].squeeze(-1)
+    idx = nearst_dist.sort(dim=1)[1]
+    # (bs, k)
+    idx_k = idx[:, :k]
+    gt_scores = torch.zeros((bs, k, num_points), device=sampling_scores.device)
+    # (bs, k) -> (bs, k, np)
+    for o in range(bs):
+        for i in range(k):
+            gt_scores[o, i, idx_k[o][i]] = 1
+    return gt_scores
 
 class HMNet(nn.Module):
     def __init__(self, args):
@@ -466,7 +485,8 @@ class HMNet(nn.Module):
                                   + translation_ab_pred_i
             mse_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity) \
                     + F.mse_loss(translation_ab_pred, translation_ab)) * self.discount_factor ** i
-            entropy_loss = self.entropy_loss(sampling_scores, src, tgt, rotation_ab, translation_ab)* self.discount_factor ** i
+            gt_scores = compute_scores_gt(sampling_scores, src, tgt, rotation_ab, translation_ab)
+            entropy_loss = self.entropy_loss(sampling_scores, gt_scores) * self.discount_factor ** i
             loss = mse_loss * (1 - self.sigma_) + entropy_loss * self.sigma_
             total_loss = total_loss + loss
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
@@ -482,16 +502,14 @@ class HMNet(nn.Module):
         total_loss = 0
         temp = torch.tensor(temp).cuda().repeat(batch_size)
         for i in range(self.num_iters):
-            rotation_ab_pred_i, translation_ab_pred_i, src_k, sampling_scores = self.forward(src, tgt, temp, i)
+            rotation_ab_pred_i, translation_ab_pred_i, sampling_scores = self.forward(src, tgt, temp, i)
             rotation_ab_pred = torch.matmul(rotation_ab_pred_i, rotation_ab_pred)
             translation_ab_pred = torch.matmul(rotation_ab_pred_i, translation_ab_pred.unsqueeze(2)).squeeze(2) \
                                   + translation_ab_pred_i
-            loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity) \
-                    + F.mse_loss(translation_ab_pred, translation_ab)) * self.discount_factor ** i
             mse_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity) \
                         + F.mse_loss(translation_ab_pred, translation_ab)) * self.discount_factor ** i
-            entropy_loss = self.entropy_loss(sampling_scores, src, tgt, rotation_ab,
-                                             translation_ab) * self.discount_factor ** i
+            gt_scores = compute_scores_gt(sampling_scores, src, tgt, rotation_ab, translation_ab)
+            entropy_loss = self.entropy_loss(sampling_scores, gt_scores) * self.discount_factor ** i
             loss = mse_loss * (1 - self.sigma_) + entropy_loss * self.sigma_
             total_loss = total_loss + loss
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)

@@ -47,24 +47,7 @@ class EntropyLoss(nn.Module):
     def __init__(self):
         super(EntropyLoss, self).__init__()
         return
-    def forward(self, sampling_scores, src, tgt, rotation_ab, translation_ab):
-        bs, k, num_points = sampling_scores.size()
-        src_corr = transform_point_cloud(src, rotation_ab, translation_ab)
-        inner = -2 * torch.matmul(src_corr.transpose(2, 1).contiguous(), tgt)
-        xx = torch.sum(src_corr ** 2, dim=1, keepdim=True)
-        yy = torch.sum(tgt ** 2, dim=1, keepdim=True)
-        distance = xx.transpose(2, 1).contiguous() + inner + yy
-        nearst_dist, _ = distance.sort(dim=-1)
-        # (bs, np)
-        nearst_dist = nearst_dist [:,:,0].squeeze(-1)
-        idx = nearst_dist.sort(dim=1)[1]
-        # (bs, k)
-        idx_k = idx[:, :k]
-        gt_scores = torch.zeros((bs, k, num_points), device=sampling_scores.device)
-        # (bs, k) -> (bs, k, np)
-        for o in range(bs):
-            for i in range(k):
-                gt_scores[o, i, idx_k[o][i]] = 1
+    def forward(self, sampling_scores, gt_scores):
         loss = torch.sum(torch.mul(sampling_scores.log(), gt_scores),dim=(2, 1))
         loss = - loss / torch.sum(gt_scores, dim=(2, 1))
         loss = torch.mean(loss)
