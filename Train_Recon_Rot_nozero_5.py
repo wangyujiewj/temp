@@ -4,6 +4,7 @@ import os
 from time import time
 from matplotlib import pyplot as plt
 from mpl_toolkits import mplot3d
+from torch.utils.tensorboard import SummaryWriter
 import math
 import scipy.io as io
 import torch
@@ -16,6 +17,7 @@ class parameter:
     def __init__(self):
         # Phantom
         self.PhantomSize = []
+
         # device
         self.device = []
 
@@ -81,10 +83,10 @@ device = torch.device("cuda:0")
 # device = torch.device("cpu")
 # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 param.device = device
-
+writer = SummaryWriter('runs/exp')
 
 ## Initialize_PhantomSize
-PhantomSize = [525, 525, 525]
+PhantomSize = [345, 345, 345]
 # Phantom_numpy = Initialize_Phantom(PhantomSize)
 # data = io.loadmat('Phantom_real_525.mat')
 Phantom_numpy = np.zeros(PhantomSize) + 10000
@@ -93,15 +95,25 @@ Phantom = torch.from_numpy(Phantom)
 Phantom = Phantom.to(param.device)
 
 ## Initialize_PSF
-mat = h5py.File('.\PSF\psf_sim_RoundAp_301_301_15_15_525.mat', 'r')
-PSF_numpy = mat['psf']
+mat = h5py.File('PSF/psf_sim_RoundAp_301_301_15_15_525.mat', 'r')
 PSF_numpy = np.transpose(mat['psf'])
 PSF_numpy = PSF_numpy.astype('float32')
+
+# PSFSizeX = 101
+# PSFSizeX_1 = int((301-1)/2 - (PSFSizeX-1)/2)
+# PSFSizeX_2 = int((301-1)/2 + (PSFSizeX-1)/2 + 1)
+# PSF_numpy = PSF_numpy[PSFSizeX_1: PSFSizeX_2, PSFSizeX_1: PSFSizeX_2, :, :, :]
+
+PSFSizeX = 345
+PSFSizeX_1 = int((525 - 1) / 2 - (PSFSizeX - 1) / 2)
+PSFSizeX_2 = int((525 - 1) / 2 + (PSFSizeX - 1) / 2 + 1)
+PSF_numpy = PSF_numpy[:, :, :, :, PSFSizeX_1: PSFSizeX_2]
+
 PSF = torch.from_numpy(PSF_numpy)
 PSFSize = PSF_numpy.shape
 
 # Projection map
-data = io.loadmat('.\WJM_Map\wjm_chyf15_map.mat')
+data = io.loadmat('WJM_Map/wjm_chyf15_map.mat')
 map = data['map']
 
 ## Rotation
@@ -139,7 +151,7 @@ threshold = 1e-4
 SavePath = 'Train_Recon_Rot' + str(Num_Rotaion) + '_711_NoZero/'
 if not os.path.exists(SavePath): os.mkdir(SavePath)
 
-WignerPath = 'Wigner_Sim/Projection_Fourier6_5_Phantom507_Rot' + str(Num_Rotaion) + '/'
+WignerPath = 'Wigner_Sim/Train_Recon_Rot' + str(Num_Rotaion) + '_345/'
 # WignerPath = 'Wigner_Sim/Wigner_Sim3_PSFRound_24angles_Phantom_real_525_2/'
 
 
@@ -149,10 +161,11 @@ Loss_list = np.zeros(stop_epoch*Num_Rotaion*map.shape[0])
 for epoch in range(0, stop_epoch):
     # optimizer.param_groups[0]['lr'] = 0.00003
     # scheduler.step()  # 步长选择器更新
-    # Model.zero_grad()
+    Model.zero_grad()
+
     # for i_rotation in range(0, Num_Rotaion):
     for i_rotation in range(0, Num_Rotaion):
-        # Model.zero_grad()
+        Model.zero_grad()
         ## Loading Projrction
         data = io.loadmat(WignerPath + 'Projrction_' + str(i_rotation) + '_' + str(Num_Rotaion))
         Projrction = data['Projrction']
@@ -169,6 +182,7 @@ for epoch in range(0, stop_epoch):
 
         ## Rotation
         # for i in range(0, RotAngle):
+        total_loss = 0
         for i_Map in range(0, map.shape[0]):
             i_ProjAngle = map[i_Map, 0]
             j_ProjAngle = map[i_Map, 1]
@@ -188,6 +202,8 @@ for epoch in range(0, stop_epoch):
 
             loss = criterion(Projrction_thisangle_numpy, Projrction_thisangle_numpy_fix)
         # warped_Phantom_numpy = np.squeeze(warped_Phantom.detach().numpy())
+
+
             loss.backward()  # 背向传播
             Loss_list[epoch*Num_Rotaion*map.shape[0] + map.shape[0] * i_rotation + i_Map] = loss.item()
             sys.stdout.write("[Train] [Epoch {}/{}] [Rotation {}/{}] [Angle {}/{}] [loss:{:.8f}] time {:.3f}\n"
@@ -195,22 +211,21 @@ for epoch in range(0, stop_epoch):
             sys.stdout.flush()
 
             optimizer.step()  # 优化器进行更新
-
+            total_loss = total_loss + loss.item()
             Phantom_threshold = torch.zeros_like(Model.Phantom) + threshold
 
             Model.Phantom.data = torch.where(Model.Phantom.data < threshold, Phantom_threshold, Model.Phantom.data)
 
-        io.savemat(SavePath + 'Loss', {'Loss': Loss_list})
-
-
+        # io.savemat(SavePath + 'Loss', {'Loss': Loss_list})
+        writer.add_scalar('training loss', total_loss / map.shape[0], epoch * i_rotation)
         Recon_Phantom_numpy = np.squeeze(Model.Phantom.cpu().detach().numpy())
 
         tif = TIFF.open(SavePath + 'Recon_Phantom_' + str(epoch) + '_' + str(i_rotation) + '.tif', mode='w')
         for i in range(0, Recon_Phantom_numpy.shape[2]):
             tif.write_image(np.squeeze(Recon_Phantom_numpy[:, :, i]))
 
-        io.savemat(SavePath + 'Recon_Phantom_' + str(epoch) + '_' + str(i_rotation),
-                   {'a': 1, 'Recon_Phantom_numpy': Recon_Phantom_numpy})
+        # io.savemat(SavePath + 'Recon_Phantom_' + str(epoch) + '_' + str(i_rotation),
+        #            {'a': 1, 'Recon_Phantom_numpy': Recon_Phantom_numpy})
 
         # warped_Phantom_fix_numpy = np.squeeze(warped_Phantom_fix.cpu().detach().numpy())
         # io.savemat(SavePath + 'warped_Phantom_fix_' + str(epoch) + '_' + str(i_rotation),
