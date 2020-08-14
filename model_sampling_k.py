@@ -273,6 +273,40 @@ class LDGCNN(nn.Module):
         net = net.squeeze(-1)
         return net
 
+class DGCNN(nn.Module):
+    def __init__(self, emb_dims=512):
+        super(DGCNN, self).__init__()
+        self.conv1 = nn.Conv2d(6, 64, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=1, bias=False)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=1, bias=False)
+        self.conv5 = nn.Conv2d(512, emb_dims, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.bn5 = nn.BatchNorm2d(emb_dims)
+
+    def forward(self, x):
+        batch_size, num_dims, num_points = x.size()
+        x = get_graph_feature(x)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x1 = x.max(dim=-1, keepdim=True)[0]
+
+        x = F.relu(self.bn2(self.conv2(x)))
+        x2 = x.max(dim=-1, keepdim=True)[0]
+
+        x = F.relu(self.bn3(self.conv3(x)))
+        x3 = x.max(dim=-1, keepdim=True)[0]
+
+        x = F.relu(self.bn4(self.conv4(x)))
+        x4 = x.max(dim=-1, keepdim=True)[0]
+
+        x = torch.cat((x1, x2, x3, x4), dim=1)
+
+        x = F.relu(self.bn5(self.conv5(x))).view(batch_size, -1, num_points)
+        return x
+
 class Identity(nn.Module):
     def __init__(self):
         super(Identity, self).__init__()
@@ -306,8 +340,6 @@ class Transformer(nn.Module):
         tgt_embedding = self.model(src, tgt, None, None).transpose(2, 1).contiguous()
         src_embedding = self.model(tgt, src, None, None).transpose(2, 1).contiguous()
         return src_embedding, tgt_embedding
-
-
 
 class SVDHead(nn.Module):
     def __init__(self, args):
@@ -352,7 +384,6 @@ class SVDHead(nn.Module):
         if self.training:
             self.my_iter += 1
         end = time.time()
-        print(end-start)
         return R, t.view(batch_size, 3)
 
 class GSS(nn.Module):
@@ -373,27 +404,16 @@ class GSS(nn.Module):
         assert (embedding.shape[2] == points.shape[2])
         # (bs, dim, num_points) -> (bs, n_keypoints, num_points)
         embedding = embedding.transpose(2, 1).contiguous()
-        # (bs, 1, np)
-        scores = self.proj(embedding).transpose(2, 1).contiguous()
+        # (bs, k, np) i.i.d.
+        scores = self.proj(embedding).repeat(1, 1, self.n_keypoints).transpose(2, 1).contiguous()
         temperature = temperature.view(batch_size, 1)
-        new_points = []
-        new_embedding = []
-        for i in range(self.n_keypoints):
-            scores = scores.view(batch_size * 1, -1)
-            scores = F.gumbel_softmax(scores, tau=temperature, hard=True)
-            # (bs, 1, np)
-            scores = scores.view(batch_size, 1, num_points)
-            # (bs, 3, 1)
-            tem_points = torch.matmul(points, scores.transpose(2, 1).contiguous())
-            # (bs, 1, dim)
-            tem_embedding = torch.matmul(scores, embedding)
-            new_points.append(tem_points)
-            new_embedding.append(tem_embedding)
-        # (bs, 3, np)
-        new_points = torch.cat(new_points, dim=-1)
-        # (bs, np, dim)
-        new_embedding = torch.cat(new_embedding, dim=1)
-        return new_embedding.transpose(2, 1).contiguous(), new_points
+        scores = scores.view(batch_size * self.n_keypoints, num_points)
+        temperature = temperature.repeat(1, self.n_keypoints, 1).view(-1, 1)
+        scores = F.gumbel_softmax(scores, tau=temperature, hard=True)
+        scores = scores.view(batch_size, self.n_keypoints, num_points)
+        new_points = torch.matmul(scores, points.transpose(2, 1).contiguous())
+        new_embedding = torch.matmul(scores, embedding)
+        return new_embedding.transpose(2, 1).contiguous(), new_points.transpose(2, 1).contiguous()
 
 class MatchNet(nn.Module):
     def __init__(self, args):
@@ -404,12 +424,56 @@ class MatchNet(nn.Module):
         self.n_iters = args.n_iters
         for i in range(self.n_iters):
             layer = LDGCNN(n_emb_dims=self.n_emb_dims)
+            # layer = DGCNN(emb_dims=self.n_emb_dims)
             attn = Transformer(args=args)
             gss = GSS(args)
             self.add_module('emb_nn_{}'.format(i), layer)
             self.add_module('attention_{}'.format(i), attn)
             self.add_module('sampling_{}'.format(i), gss)
         self.head = SVDHead(args=args)
+
+    def weight_svd(self, src_embedding_k, tgt_embedding, src_k, tgt):
+        batch_size, d_k, num_points_k = src_k.size()
+        num_points = tgt.shape[2]
+        # (bs, k, np)
+        scores = torch.matmul(src_embedding_k.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
+        scores = F.softmax(scores, dim=-1)
+        src_k_corr = torch.matmul(tgt, scores.transpose(2, 1).contiguous())
+        src_corr_embedding_k = torch.matmul(tgt_embedding, scores.transpose(2, 1).contiguous())
+        inner = torch.matmul(src_embedding_k.transpose(2, 1).contiguous(), src_corr_embedding_k) / math.sqrt(d_k)
+        # (bs, k)
+        inner_diag = torch.diagonal(inner, dim1=1, dim2=2)
+        # (bs, 1)
+        weights_sum = torch.sum(inner_diag, dim=-1, keepdim=True)
+        # (bs, k)
+        weights_norm = inner_diag / (weights_sum + 1e-8)
+        # (bs, k)
+        # weights = -torch.sum(torch.mul(scores, torch.log(scores + 1e-6)), dim=-1)
+        # (bs, 1, k)
+        weights_norm = weights_norm.unsqueeze(1)
+        centroid_src = torch.sum(torch.mul(src_k, weights_norm), dim=2, keepdim=True)
+        centroid_tgt = torch.sum(torch.mul(src_k_corr, weights_norm), dim=2, keepdim=True)
+        src_centered = src_k - centroid_src
+        src_corr_centered = src_k_corr - centroid_tgt
+        src_corr_centered = torch.mul(src_corr_centered, weights_norm)
+        H = torch.matmul(src_centered, src_corr_centered.transpose(2, 1).contiguous()).cpu()
+        R = []
+        for i in range(batch_size):
+            try:
+                u, s, v = torch.svd(H[i])
+            except:
+                print(H[i])
+            r = torch.matmul(v, u.transpose(1, 0)).contiguous()
+            r_det = torch.det(r).item()
+            diag = torch.from_numpy(np.array([[1.0, 0, 0],
+                                              [0, 1.0, 0],
+                                              [0, 0, r_det]]).astype('float32')).to(v.device)
+            r = torch.matmul(torch.matmul(v, diag), u.transpose(1, 0)).contiguous()
+            R.append(r)
+        R = torch.stack(R, dim=0).cuda()
+        t = torch.matmul(-R, centroid_src) + centroid_tgt
+        return R, t.view(batch_size, 3)
+
     def forward(self, *input):
         src = input[0]
         tgt = input[1]
@@ -508,6 +572,7 @@ class HMNet(nn.Module):
             translations_ab_pred.append(translation_ab_pred.detach().cpu().numpy())
             eulers_ab.append(euler_ab.cpu().numpy())
         avg_loss = total_loss / num_examples
+        # (num_examples, 3, 3)
         rotations_ab = np.concatenate(rotations_ab, axis=0)
         translations_ab = np.concatenate(translations_ab, axis=0)
         rotations_ab_pred = np.concatenate(rotations_ab_pred, axis=0)
@@ -517,6 +582,10 @@ class HMNet(nn.Module):
         r_ab_mse = np.mean((eulers_ab - eulers_ab_pred) ** 2)
         r_ab_rmse = np.sqrt(r_ab_mse)
         r_ab_mae = np.mean(np.abs(eulers_ab - eulers_ab_pred))
+        rot = np.matmul(rotations_ab_pred.transpose(0, 2, 1), rotations_ab)
+        rot_trace = rot[:, 0, 0] + rot[:, 1, 1] + rot[:, 2, 2]
+        residual_rotdeg = np.arccos(np.clip(0.5 * (rot_trace - 1), min=-1.0, max=1.0)) * 180.0 / np.pi
+        residual_rotdeg = np.mean(residual_rotdeg)
         t_ab_mse = np.mean((translations_ab - translations_ab_pred) ** 2)
         t_ab_rmse = np.sqrt(t_ab_mse)
         t_ab_mae = np.mean(np.abs(translations_ab - translations_ab_pred))
@@ -534,6 +603,7 @@ class HMNet(nn.Module):
                 't_ab_mae': t_ab_mae,
                 'r_ab_r2_score': r_ab_r2_score,
                 't_ab_r2_score': t_ab_r2_score,
+                'residual_rotdeg': residual_rotdeg,
                 'temperature': temp}
         self.logger.write(info)
         return info
@@ -570,6 +640,10 @@ class HMNet(nn.Module):
         r_ab_mse = np.mean((eulers_ab - eulers_ab_pred) ** 2)
         r_ab_rmse = np.sqrt(r_ab_mse)
         r_ab_mae = np.mean(np.abs(eulers_ab - eulers_ab_pred))
+        rot = np.matmul(rotations_ab_pred.transpose(0, 2, 1), rotations_ab)
+        rot_trace = rot[:, 0, 0] + rot[:, 1, 1] + rot[:, 2, 2]
+        residual_rotdeg = np.arccos(np.clip(0.5 * (rot_trace - 1), min=-1.0, max=1.0)) * 180.0 / np.pi
+        residual_rotdeg = np.mean(residual_rotdeg)
         t_ab_mse = np.mean((translations_ab - translations_ab_pred) ** 2)
         t_ab_rmse = np.sqrt(t_ab_mse)
         t_ab_mae = np.mean(np.abs(translations_ab - translations_ab_pred))
@@ -587,6 +661,7 @@ class HMNet(nn.Module):
                 't_ab_mae': t_ab_mae,
                 'r_ab_r2_score': r_ab_r2_score,
                 't_ab_r2_score': t_ab_r2_score,
+                'residual_rotdeg': residual_rotdeg,
                 'temperature': temp}
         self.logger.write(info)
         return info
@@ -626,12 +701,13 @@ class Logger:
         t_ab_mae = info['t_ab_mae']
         r_ab_r2_score = info['r_ab_r2_score']
         t_ab_r2_score = info['t_ab_r2_score']
+        residual_rotdeg = info['residual_rotdeg']
         temperature = info['temperature']
         text = '%s:: Stage: %s, Epoch: %d, Loss: %f, Rot_MSE: %f, Rot_RMSE: %f, ' \
                'Rot_MAE: %f, Rot_R2: %f, Trans_MSE: %f, ' \
-               'Trans_RMSE: %f, Trans_MAE: %f, Trans_R2: %f, temperature: %f\n' % \
+               'Trans_RMSE: %f, Trans_MAE: %f, Trans_R2: %f, Rot_deg: %f, temperature: %f\n' % \
                (arrow, stage, epoch, loss, r_ab_mse, r_ab_rmse, r_ab_mae,
-                r_ab_r2_score, t_ab_mse, t_ab_rmse, t_ab_mae, t_ab_r2_score, temperature)
+                r_ab_r2_score, t_ab_mse, t_ab_rmse, t_ab_mae, t_ab_r2_score, residual_rotdeg, temperature)
         self.fw.write(text)
         self.fw.flush()
         print(text)
