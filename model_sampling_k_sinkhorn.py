@@ -342,25 +342,19 @@ class SVDHead(nn.Module):
         # (bs, k, np)
         scores = torch.matmul(src_embedding_k.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
         log_perm_matrix = self.sinkhorn(scores, n_iters=20)
+        # (bs, k, np)
         perm_matrix = torch.exp(log_perm_matrix)
-        src_corr_k = torch.matmul(tgt, perm_matrix.transpose(2, 1).contiguous())
-        # src_corr_embedding_k = torch.matmul(tgt_embedding, perm_matrix.transpose(2, 1).contiguous())
-        # inner = torch.matmul(src_embedding_k.transpose(2, 1).contiguous(), src_corr_embedding_k) / math.sqrt(d_k)
-        # # (bs, k)
-        # inner_diag = torch.diagonal(inner, dim1=1, dim2=2)
-        # # (bs, 1)
-        # weights_sum = torch.sum(inner_diag, dim=-1, keepdim=True)
-        # # (bs, k)
-        # weights_norm = inner_diag / (weights_sum + 1e-8)
-        # # (bs, 1, k)
-        # weights_norm = weights_norm.unsqueeze(1)
-        # centroid_src = torch.sum(torch.mul(src_k, weights_norm), dim=2, keepdim=True)
-        # centroid_tgt = torch.sum(torch.mul(src_corr_k, weights_norm), dim=2, keepdim=True)
-        src_centered = src_k - src_k.mean(dim=2, keepdim=True)
-        src_corr_centered = src_corr_k - src_corr_k.mean(dim=2, keepdim=True)
-        # src_centered = src_k - centroid_src
-        # src_corr_centered = src_corr_k - centroid_tgt
-        # src_corr_centered = torch.mul(src_corr_centered, weights_norm)
+        # (bs, 1, k)
+        weights = torch.sum(perm_matrix, dim=2, keepdim=True).transpose(2, 1).contiguous()
+        # (bs, 3, k)
+        src_corr_k = torch.matmul(tgt, perm_matrix.transpose(2, 1).contiguous()) / (weights + 1e-8)
+        # (bs, 1, k)
+        weights_norm = weights / torch.sum(weights, dim=-1, keepdim=True)
+        centroid_src = torch.sum(torch.mul(src_k, weights_norm), dim=2, keepdim=True)
+        centroid_tgt = torch.sum(torch.mul(src_corr_k, weights_norm), dim=2, keepdim=True)
+        src_centered = src_k - centroid_src
+        src_corr_centered = src_corr_k - centroid_tgt
+        src_corr_centered = torch.mul(src_corr_centered, weights_norm)
         H = torch.matmul(src_centered, src_corr_centered.transpose(2, 1).contiguous()).cpu()
         R = []
         for i in range(batch_size):
