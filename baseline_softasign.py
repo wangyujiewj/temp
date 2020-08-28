@@ -347,11 +347,6 @@ class SVDHead(nn.Module):
         weighted_tgt = torch.matmul(tgt, perm_matrix_norm.transpose(2, 1).contiguous())
         # (bs, k, 1)
         weights = torch.sum(perm_matrix, dim=-1, keepdim=True)
-        weights_zeros = torch.zeros_like(weights)
-        # (bs, 1, 1)
-        weights_median = torch.median(weights, dim=1)[0].squeeze(-1)
-        for bs in range(batch_size):
-            weights[bs, :, :] = torch.where(weights[bs, :, :] > weights_median[bs], weights, weights_zeros)
         # (bs, k, 1)
         weights_norm = weights / (torch.sum(weights, dim=1, keepdim=True)+1e-8)
         # (bs, 1, k)
@@ -390,7 +385,6 @@ class GSS(nn.Module):
         # self.bn1 = nn.BatchNorm1d(64)
         # self.bn2 = nn.BatchNorm1d(1)
         # self.proj = nn.Linear(self.dims, 1).cuda()
-
     def forward(self, *input):
         embedding = input[0]
         points = input[1]
@@ -414,7 +408,7 @@ class GSS(nn.Module):
         scores = scores.view(batch_size, self.n_keypoints, num_points)
         new_points = torch.matmul(scores, points.transpose(2, 1).contiguous())
         new_embedding = torch.matmul(scores, embedding.transpose(2, 1).contiguous())
-        return new_embedding.transpose(2, 1).contiguous(), new_points.transpose(2, 1).contiguous()
+        return new_embedding.transpose(2, 1).contiguous(), new_points.transpose(2, 1).contiguous(), scores
 
 class MatchNet(nn.Module):
     def __init__(self, args):
@@ -445,9 +439,9 @@ class MatchNet(nn.Module):
         src_embedding = src_embedding + src_embedding_p
         tgt_embedding = tgt_embedding + tgt_embedding_p
         sampling = getattr(self, 'sampling_{}'.format(i))
-        src_embedding_k, src_k = sampling(src_embedding, src, temp)
+        src_embedding_k, src_k, kp_scores = sampling(src_embedding, src, temp)
         rotation_ab, translation_ab = self.head(src_embedding_k, tgt_embedding, src_k, tgt, temp)
-        return rotation_ab, translation_ab
+        return rotation_ab, translation_ab, kp_scores, src_k
 
 
 class HMNet(nn.Module):
@@ -463,8 +457,30 @@ class HMNet(nn.Module):
         if torch.cuda.device_count() > 1:
             self.match_net = nn.DataParallel(self.match_net)
     def forward(self, *input):
-        rotation_ab, translation_ab = self.match_net(*input)
-        return rotation_ab, translation_ab
+        rotation_ab, translation_ab, kp_scores, src_k = self.match_net(*input)
+        return rotation_ab, translation_ab, kp_scores, src_k
+    # kp_scores: (bs, k, np)
+    # src_k: (bs, 3, k)
+    def compute_loss(self, kp_scores, src_k, rotation_ab, translation_ab, tgt):
+        src_k_gt = transform_point_cloud(src_k, rotation_ab, translation_ab)
+        dists = pairwise_distance(src_k_gt, tgt)
+        # (bs, k, np)
+        sort_distance, sort_id = torch.sort(dists, dim=-1)
+        # (bs, k, 1) 距离最近的id 设阈值小于0.1的为关键点
+        TD = sort_id[:, :, 0, None]
+        # (bs, k, 1)
+        nearest_dist = sort_distance[:, :, 0, None]
+        # (bs, k, 1)
+        S = torch.gather(kp_scores, dim=-1, index=TD)
+        S_zeros = torch.zeros_like(S)
+        ind_S = torch.where(nearest_dist > 0.1, S_zeros, -torch.log(S + 1e-8))
+        S_loss = torch.mean(ind_S)
+        return S_loss
+        # (bs, 1, 1)
+        # weights_median = torch.median(weights, dim=1)[0].squeeze(-1)
+        # for bs in range(batch_size):
+        #     weights[bs, :, :] = torch.where(weights[bs, :, :] > weights_median[bs], weights[bs, :, :],
+        #                                     weights_zeros[bs, :, :])
 
     def _train_one_batch(self, src, tgt, rotation_ab, translation_ab, opt, temp):
         opt.zero_grad()
@@ -476,13 +492,14 @@ class HMNet(nn.Module):
         total_loss = 0
         temp = torch.tensor(temp).cuda().repeat(batch_size)
         for i in range(self.num_iters):
-            rotation_ab_pred_i, translation_ab_pred_i = self.forward(src, tgt, temp, i)
+            rotation_ab_pred_i, translation_ab_pred_i, kp_scores, src_k = self.forward(src, tgt, temp, i)
             rotation_ab_pred = torch.matmul(rotation_ab_pred_i, rotation_ab_pred)
             translation_ab_pred = torch.matmul(rotation_ab_pred_i, translation_ab_pred.unsqueeze(2)).squeeze(2) \
                                   + translation_ab_pred_i
             loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity) \
                     + F.mse_loss(translation_ab_pred, translation_ab)) * self.discount_factor ** i
-            total_loss = total_loss + loss
+            entropy_loss = self.compute_loss(kp_scores, src_k, rotation_ab, translation_ab, tgt) * self.discount_factor ** i
+            total_loss = total_loss + loss + entropy_loss * 0.2
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         total_loss.backward()
         opt.step()
@@ -496,14 +513,14 @@ class HMNet(nn.Module):
         total_loss = 0
         temp = torch.tensor(temp).cuda().repeat(batch_size)
         for i in range(self.num_iters):
-            rotation_ab_pred_i, translation_ab_pred_i = self.forward(src, tgt, temp, i)
+            rotation_ab_pred_i, translation_ab_pred_i, kp_scores, src_k = self.forward(src, tgt, temp, i)
             rotation_ab_pred = torch.matmul(rotation_ab_pred_i, rotation_ab_pred)
             translation_ab_pred = torch.matmul(rotation_ab_pred_i, translation_ab_pred.unsqueeze(2)).squeeze(2) \
                                   + translation_ab_pred_i
-
             loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity) \
                     + F.mse_loss(translation_ab_pred, translation_ab)) * self.discount_factor ** i
-            total_loss = total_loss + loss
+            entropy_loss = self.compute_loss(kp_scores, src_k, rotation_ab, translation_ab, tgt) * self.discount_factor ** i
+            total_loss = total_loss + loss + entropy_loss * 0.2
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         return total_loss.item(), rotation_ab_pred, translation_ab_pred
 
