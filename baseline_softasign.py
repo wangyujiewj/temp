@@ -373,7 +373,7 @@ class SVDHead(nn.Module):
             R.append(r)
         R = torch.stack(R, dim=0).cuda()
         t = torch.matmul(-R, src_centroid) + tgt_centroid
-        return R, t.view(batch_size, 3), perm_matrix
+        return R, t.view(batch_size, 3)
 
 class GSS(nn.Module):
     def __init__(self, args):
@@ -408,7 +408,7 @@ class GSS(nn.Module):
         scores = scores.view(batch_size, self.n_keypoints, num_points)
         new_points = torch.matmul(scores, points.transpose(2, 1).contiguous())
         new_embedding = torch.matmul(scores, embedding.transpose(2, 1).contiguous())
-        return new_embedding.transpose(2, 1).contiguous(), new_points.transpose(2, 1).contiguous()
+        return new_embedding.transpose(2, 1).contiguous(), new_points.transpose(2, 1).contiguous(), scores
 
 class MatchNet(nn.Module):
     def __init__(self, args):
@@ -439,8 +439,8 @@ class MatchNet(nn.Module):
         src_embedding = src_embedding + src_embedding_p
         tgt_embedding = tgt_embedding + tgt_embedding_p
         sampling = getattr(self, 'sampling_{}'.format(i))
-        src_embedding_k, src_k = sampling(src_embedding, src, temp)
-        rotation_ab, translation_ab, scores = self.head(src_embedding_k, tgt_embedding, src_k, tgt, temp)
+        src_embedding_k, src_k, scores = sampling(src_embedding, src, temp)
+        rotation_ab, translation_ab = self.head(src_embedding_k, tgt_embedding, src_k, tgt, temp)
         return rotation_ab, translation_ab, scores, src_k
 
 
@@ -499,7 +499,9 @@ class HMNet(nn.Module):
                                   + translation_ab_pred_i
             loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity) \
                     + F.mse_loss(translation_ab_pred, translation_ab)) * self.discount_factor ** i
-            entropy_loss = self.compute_loss(scores, src_k, rotation_ab, translation_ab, tgt) * self.discount_factor ** i
+            res_rotation_ab = torch.matmul(rotation_ab, rotation_ab_pred.transpose(2, 1))
+            res_translation_ab = translation_ab - torch.matmul(res_rotation_ab, translation_ab_pred.unsqueeze(2)).squeeze(2)
+            entropy_loss = self.compute_loss(scores, src_k, res_rotation_ab, res_translation_ab, tgt) * self.discount_factor ** i
             total_loss = total_loss + loss + entropy_loss * 0.5
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         total_loss.backward()
@@ -520,7 +522,10 @@ class HMNet(nn.Module):
                                   + translation_ab_pred_i
             loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity) \
                     + F.mse_loss(translation_ab_pred, translation_ab)) * self.discount_factor ** i
-            entropy_loss = self.compute_loss(scores, src_k, rotation_ab, translation_ab, tgt) * self.discount_factor ** i
+            res_rotation_ab = torch.matmul(rotation_ab, rotation_ab_pred.transpose(2, 1))
+            res_translation_ab = translation_ab - torch.matmul(res_rotation_ab,
+                                                               translation_ab_pred.unsqueeze(2)).squeeze(2)
+            entropy_loss = self.compute_loss(scores, src_k, res_rotation_ab, res_translation_ab, tgt) * self.discount_factor ** i
             total_loss = total_loss + loss + entropy_loss * 0.5
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         return total_loss.item(), rotation_ab_pred, translation_ab_pred
