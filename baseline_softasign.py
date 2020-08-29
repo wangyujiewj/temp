@@ -426,6 +426,33 @@ class MatchNet(nn.Module):
             self.add_module('sampling_{}'.format(i), gss)
         self.head = SVDHead(args=args)
 
+    def svd(self, src_embedding, tgt_embedding, src, tgt, temp):
+        # batch_size, d_k, num_points_k = src.size()
+        batch_size, d_k, num_points_k = src_embedding.size()
+        num_points = tgt.shape[2]
+        temperature = temp.view(batch_size, 1, 1)
+        # (bs, k, np)
+        scores = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
+        scores = scores / temperature
+        scores = F.softmax(scores, dim=-1)
+        src_corr = torch.matmul(tgt, scores.transpose(2, 1).contiguous())
+        src_centered = src - src.mean(dim=2, keepdim=True)
+        src_corr_centered = src_corr - src_corr.mean(dim=2, keepdim=True)
+        H = torch.matmul(src_centered, src_corr_centered.transpose(2, 1).contiguous()).cpu()
+        R = []
+        for i in range(src.size(0)):
+            u, s, v = torch.svd(H[i])
+            r = torch.matmul(v, u.transpose(1, 0)).contiguous()
+            r_det = torch.det(r).item()
+            diag = torch.from_numpy(np.array([[1.0, 0, 0],
+                                              [0, 1.0, 0],
+                                              [0, 0, r_det]]).astype('float32')).to(v.device)
+            r = torch.matmul(torch.matmul(v, diag), u.transpose(1, 0)).contiguous()
+            R.append(r)
+        R = torch.stack(R, dim=0).cuda()
+        t = torch.matmul(-R, src.mean(dim=2, keepdim=True)) + src_corr.mean(dim=2, keepdim=True)
+        return R, t.view(batch_size, 3), scores
+
     def forward(self, *input):
         src = input[0]
         tgt = input[1]
@@ -440,9 +467,8 @@ class MatchNet(nn.Module):
         tgt_embedding = tgt_embedding + tgt_embedding_p
         sampling = getattr(self, 'sampling_{}'.format(i))
         src_embedding_k, src_k = sampling(src_embedding, src, temp)
-        rotation_ab, translation_ab, scores = self.head(src_embedding_k, tgt_embedding, src_k, tgt, temp)
+        rotation_ab, translation_ab, scores = self.svd(src_embedding_k, tgt_embedding, src_k, tgt, temp)
         return rotation_ab, translation_ab, scores, src_k
-
 
 class HMNet(nn.Module):
     def __init__(self, args):
@@ -461,7 +487,7 @@ class HMNet(nn.Module):
         return rotation_ab, translation_ab, kp_scores, src_k
     # kp_scores: (bs, k, np)
     # src_k: (bs, 3, k)
-    def compute_loss(self, kp_scores, src_k, rotation_ab, translation_ab, tgt):
+    def compute_loss(self, scores, src_k, rotation_ab, translation_ab, tgt):
         src_k_gt = transform_point_cloud(src_k, rotation_ab, translation_ab)
         # view_pointclouds(src_k_gt.squeeze(0).cpu().detach().numpy().T, tgt.squeeze(0).cpu().detach().numpy().T)
         dists = pairwise_distance(src_k_gt, tgt)
@@ -472,10 +498,10 @@ class HMNet(nn.Module):
         # (bs, k, 1)
         nearest_dist = sort_distance[:, :, 0, None]
         # (bs, k, 1)
-        S = torch.gather(kp_scores, dim=-1, index=TD)
+        S = - torch.sum(torch.mul(scores, torch.log(scores + 1e-8)), dim=-1, keepdim=True)
         S_zeros = torch.zeros_like(S)
         # 超参需要手动调整
-        ind_S = torch.where(nearest_dist > 0.08, S_zeros, -torch.log(S + 1e-8))
+        ind_S = torch.where(nearest_dist > 0.08, S_zeros, S)
         S_loss = torch.mean(ind_S)
         return S_loss
         # (bs, 1, 1)
