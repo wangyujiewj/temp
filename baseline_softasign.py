@@ -373,7 +373,7 @@ class SVDHead(nn.Module):
             R.append(r)
         R = torch.stack(R, dim=0).cuda()
         t = torch.matmul(-R, src_centroid) + tgt_centroid
-        return R, t.view(batch_size, 3)
+        return R, t.view(batch_size, 3), perm_matrix
 
 class GSS(nn.Module):
     def __init__(self, args):
@@ -408,7 +408,7 @@ class GSS(nn.Module):
         scores = scores.view(batch_size, self.n_keypoints, num_points)
         new_points = torch.matmul(scores, points.transpose(2, 1).contiguous())
         new_embedding = torch.matmul(scores, embedding.transpose(2, 1).contiguous())
-        return new_embedding.transpose(2, 1).contiguous(), new_points.transpose(2, 1).contiguous(), scores
+        return new_embedding.transpose(2, 1).contiguous(), new_points.transpose(2, 1).contiguous()
 
 class MatchNet(nn.Module):
     def __init__(self, args):
@@ -439,8 +439,8 @@ class MatchNet(nn.Module):
         src_embedding = src_embedding + src_embedding_p
         tgt_embedding = tgt_embedding + tgt_embedding_p
         sampling = getattr(self, 'sampling_{}'.format(i))
-        src_embedding_k, src_k, scores = sampling(src_embedding, src, temp)
-        rotation_ab, translation_ab = self.head(src_embedding_k, tgt_embedding, src_k, tgt, temp)
+        src_embedding_k, src_k = sampling(src_embedding, src, temp)
+        rotation_ab, translation_ab, scores = self.head(src_embedding_k, tgt_embedding, src_k, tgt, temp)
         return rotation_ab, translation_ab, scores, src_k
 
 
