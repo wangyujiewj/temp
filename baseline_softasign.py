@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import r2_score
 from util import transform_point_cloud, npmat2euler, quat2mat
+from detect_flow import view_pointclouds
 
 def clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
@@ -373,7 +374,7 @@ class SVDHead(nn.Module):
             R.append(r)
         R = torch.stack(R, dim=0).cuda()
         t = torch.matmul(-R, src_centroid) + tgt_centroid
-        return R, t.view(batch_size, 3), perm_matrix
+        return R, t.view(batch_size, 3), perm_matrix_norm
 
 class GSS(nn.Module):
     def __init__(self, args):
@@ -386,17 +387,16 @@ class GSS(nn.Module):
         # self.bn2 = nn.BatchNorm1d(1)
         # self.proj = nn.Linear(self.dims, 1).cuda()
     def forward(self, *input):
-        embedding = input[0]
+        src_embedding = input[0]
         points = input[1]
-        batch_size = points.shape[0]
-        num_points = points.shape[2]
+        batch_size, d_k, num_points = src_embedding.size()
         temperature = input[2].view(batch_size, 1, 1)
-        assert (embedding.shape[2] == points.shape[2])
+        assert (src_embedding.shape[2] == points.shape[2])
         # (bs, dim, num_points) -> (bs, n_keypoints, num_points)
         # (bs, k, np) i.i.d.
         # x = F.leaky_relu(self.bn1(self.conv1(embedding)))
         # (bs, 1, np)
-        x = self.conv1(embedding)
+        x = self.conv1(src_embedding)
         # (bs, 1, np) 加上relu之后很多负值变成了0
         # x = F.sigmoid(self.bn2(self.conv2(x)))
         # (bs, k, np)
@@ -404,10 +404,10 @@ class GSS(nn.Module):
         temperature = temperature.view(batch_size, 1)
         scores = scores.view(batch_size * self.n_keypoints, num_points)
         temperature = temperature.repeat(1, self.n_keypoints, 1).view(-1, 1)
-        scores = F.gumbel_softmax(scores, tau=temperature, hard=False)
+        scores = F.gumbel_softmax(scores, tau=temperature, hard=True)
         scores = scores.view(batch_size, self.n_keypoints, num_points)
         new_points = torch.matmul(scores, points.transpose(2, 1).contiguous())
-        new_embedding = torch.matmul(scores, embedding.transpose(2, 1).contiguous())
+        new_embedding = torch.matmul(scores, src_embedding.transpose(2, 1).contiguous())
         return new_embedding.transpose(2, 1).contiguous(), new_points.transpose(2, 1).contiguous()
 
 class MatchNet(nn.Module):
@@ -463,6 +463,7 @@ class HMNet(nn.Module):
     # src_k: (bs, 3, k)
     def compute_loss(self, kp_scores, src_k, rotation_ab, translation_ab, tgt):
         src_k_gt = transform_point_cloud(src_k, rotation_ab, translation_ab)
+        # view_pointclouds(src_k_gt.squeeze(0).cpu().detach().numpy().T, tgt.squeeze(0).cpu().detach().numpy().T)
         dists = pairwise_distance(src_k_gt, tgt)
         # (bs, k, np)
         sort_distance, sort_id = torch.sort(dists, dim=-1)
@@ -542,6 +543,7 @@ class HMNet(nn.Module):
             total_loss = total_loss + loss + entropy_loss * 0.5
             # 这个时候点云才会变
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
+
         return total_loss.item(), rotation_ab_pred, translation_ab_pred
 
     def _train_one_epoch(self, epoch, train_loader, opt, temp):
