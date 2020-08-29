@@ -476,6 +476,14 @@ class HMNet(nn.Module):
         rotation_ab_pred = torch.eye(3, device=src.device, dtype=torch.float32).view(1, 3, 3).repeat(batch_size, 1, 1)
         translation_ab_pred = torch.zeros(3, device=src.device, dtype=torch.float32).view(1, 3).repeat(batch_size, 1)
         total_loss = 0
+        with torch.no_grad():
+            distance = pairwise_distance(src, src)
+            sort_distance, _ = torch.sort(distance, dim=-1)
+            nearest_distance = sort_distance[:, :, 1].squeeze()
+            median = torch.median(nearest_distance, dim=-1)[0]
+            meanDist = torch.mean(median)
+            sigmal_ = meanDist * self.sigma_times
+            sigmal_ = sigmal_.repeat(batch_size)
         temp = torch.tensor(temp).cuda().repeat(batch_size)
         res_rotation_ab = rotation_ab
         res_translation_ab = translation_ab
