@@ -432,16 +432,30 @@ class MatchNet(nn.Module):
         num_points = tgt.shape[2]
         temperature = temp.view(batch_size, 1, 1)
         # (bs, k, np)
-        scores = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
-        scores = scores / temperature
-        scores = F.softmax(scores, dim=-1)
+        affinity = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
+        affinity = affinity / temperature
+        scores = F.softmax(affinity, dim=-1)
+        # (bs, 3, k)
         src_corr = torch.matmul(tgt, scores.transpose(2, 1).contiguous())
-        src_centered = src - src.mean(dim=2, keepdim=True)
-        src_corr_centered = src_corr - src_corr.mean(dim=2, keepdim=True)
+        # (bs, k, 1)
+        weights = torch.sum(affinity, dim=-1, keepdim=True)
+        # (bs, k, 1)
+        weights_norm = weights / (torch.sum(weights, dim=1, keepdim=True) + 1e-8)
+        # (bs, 1, k)
+        weights_norm = weights_norm.transpose(2, 1).contiguous()
+        # (bs, 3, 1)
+        src_centroid = torch.sum(torch.mul(src, weights_norm), dim=2, keepdim=True)
+        tgt_centroid = torch.sum(torch.mul(src_corr, weights_norm), dim=2, keepdim=True)
+        src_centered = src - src_centroid
+        src_corr_centered = src_corr - tgt_centroid
+        src_corr_centered = torch.mul(src_corr_centered, weights_norm)
         H = torch.matmul(src_centered, src_corr_centered.transpose(2, 1).contiguous()).cpu()
         R = []
         for i in range(src.size(0)):
-            u, s, v = torch.svd(H[i])
+            try:
+                u, s, v = torch.svd(H[i])
+            except:
+                print(H[i])
             r = torch.matmul(v, u.transpose(1, 0)).contiguous()
             r_det = torch.det(r).item()
             diag = torch.from_numpy(np.array([[1.0, 0, 0],
