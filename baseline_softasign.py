@@ -429,7 +429,6 @@ class MatchNet(nn.Module):
     def svd(self, src_embedding, tgt_embedding, src, tgt, temp):
         # batch_size, d_k, num_points_k = src.size()
         batch_size, d_k, num_points_k = src_embedding.size()
-        num_points = tgt.shape[2]
         temperature = temp.view(batch_size, 1, 1)
         # (bs, k, np)
         affinity = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
@@ -437,18 +436,9 @@ class MatchNet(nn.Module):
         scores = F.softmax(affinity, dim=-1)
         # (bs, 3, k)
         src_corr = torch.matmul(tgt, scores.transpose(2, 1).contiguous())
-        # (bs, k, 1)
-        weights = torch.sum(affinity, dim=-1, keepdim=True)
-        # (bs, k, 1)
-        weights_norm = weights / (torch.sum(weights, dim=1, keepdim=True) + 1e-8)
-        # (bs, 1, k)
-        weights_norm = weights_norm.transpose(2, 1).contiguous()
-        # (bs, 3, 1)
-        src_centroid = torch.sum(torch.mul(src, weights_norm), dim=2, keepdim=True)
-        tgt_centroid = torch.sum(torch.mul(src_corr, weights_norm), dim=2, keepdim=True)
-        src_centered = src - src_centroid
-        src_corr_centered = src_corr - tgt_centroid
-        src_corr_centered = torch.mul(src_corr_centered, weights_norm)
+        src_centered = src - src.mean(dim=2, keepdim=True)
+        src_corr_centered = src_corr - src_corr.mean(dim=2, keepdim=True)
+        # H = torch.matmul(src_centered, src_corr_centered.transpose(2, 1).contiguous()).cpu() + torch.eye(3) * 1e-7
         H = torch.matmul(src_centered, src_corr_centered.transpose(2, 1).contiguous()).cpu()
         R = []
         for i in range(src.size(0)):
@@ -550,7 +540,7 @@ class HMNet(nn.Module):
             entropy_loss = self.compute_loss(scores, src_k, res_rotation_ab, res_translation_ab,
                                              tgt) * self.discount_factor ** i
             # 总loss
-            total_loss = total_loss + loss + entropy_loss * 0.5
+            total_loss = total_loss + loss + entropy_loss * 0.2
             # 这个时候点云才会变
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         total_loss.backward()
@@ -580,7 +570,7 @@ class HMNet(nn.Module):
             # 关键点loss
             entropy_loss = self.compute_loss(scores, src_k, res_rotation_ab, res_translation_ab, tgt) * self.discount_factor ** i
             # 总loss
-            total_loss = total_loss + loss + entropy_loss * 0.5
+            total_loss = total_loss + loss + entropy_loss * 0.2
             # 这个时候点云才会变
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
 
