@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import r2_score
 from util import transform_point_cloud, npmat2euler, quat2mat
-from detect_flow import view_pointclouds
+# from detect_flow import view_pointclouds
 
 def clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
@@ -309,10 +309,10 @@ class SVDHead(nn.Module):
         self.reflect = nn.Parameter(torch.eye(3), requires_grad=False)
         self.reflect[2, 2] = -1
         self.my_iter = torch.ones(1)
-        self.conv1 = nn.Conv1d(1, 64, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.conv2 = nn.Conv1d(64, 1, kernel_size=1, bias=False)
-        self.bn2 = nn.BatchNorm1d(1)
+        # self.conv1 = nn.Conv1d(1, 64, kernel_size=1, bias=False)
+        # self.bn1 = nn.BatchNorm1d(64)
+        # self.conv2 = nn.Conv1d(64, 1, kernel_size=1, bias=False)
+        # self.bn2 = nn.BatchNorm1d(1)
 
     def sinkhorn(self, scores, n_iters):
         # scores: (bs, k, np)
@@ -342,8 +342,12 @@ class SVDHead(nn.Module):
         batch_size, d_k, num_points_k = src_embedding.size()
         num_points = tgt.shape[2]
         temperature = input[4].view(batch_size, 1, 1)
+        # (bs, dim, np)
+        src_embedding = src_embedding / (torch.norm(src_embedding, dim=1, keepdim=True) + 1e-8)
+        # (bs, dim, np)
+        tgt_embedding = tgt_embedding / (torch.norm(tgt_embedding, dim=1, keepdim=True) + 1e-8)
         # (bs, np, np)
-        dists = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
+        dists = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding)
         affinity = dists / temperature
         # (bs, np, np)
         log_perm_matrix = self.sinkhorn(affinity, n_iters=5)
@@ -354,19 +358,19 @@ class SVDHead(nn.Module):
         src_corr = torch.matmul(tgt, perm_matrix_norm.transpose(2, 1).contiguous())
         # (bs, dim, np)
         src_corr_embedding = torch.matmul(tgt_embedding, perm_matrix_norm.transpose(2, 1).contiguous())
-        embedding = torch.matmul(src_embedding.transpose(2, 1).contiguous(), src_corr_embedding) / math.sqrt(d_k)
+        embedding = torch.matmul(src_embedding.transpose(2, 1).contiguous(), src_corr_embedding)
         # (bs, 1, np)
         embedding = torch.diagonal(embedding, dim1=-2, dim2=-1).unsqueeze(1)
         # embedding = torch.cat([src_embedding, src_corr_embedding], dim=1)
         # (bs, 1, np)
-        x = F.relu(self.bn1(self.conv1(embedding)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        corr_scores = x.repeat(1, self.n_keypoints, 1)
+        # x = F.relu(self.bn1(self.conv1(embedding)))
+        # x = F.relu(self.bn2(self.conv2(x)))
+        corr_scores = embedding.repeat(1, self.n_keypoints, 1)
         temperature = temperature.view(batch_size, 1)
         corr_scores = corr_scores.view(batch_size * self.n_keypoints, num_points)
         temperature = temperature.repeat(1, self.n_keypoints, 1).view(-1, 1)
         corr_scores = F.gumbel_softmax(corr_scores, tau=temperature, hard=True)
-        # (bs, k, np)
+        # (bs, k, k)
         corr_scores = corr_scores.view(batch_size, self.n_keypoints, num_points)
         src_k = torch.matmul(corr_scores, src.transpose(2, 1).contiguous()).transpose(2, 1).contiguous()
         src_corr_k = torch.matmul(corr_scores, src_corr.transpose(2, 1).contiguous()).transpose(2, 1).contiguous()
