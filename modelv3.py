@@ -314,6 +314,26 @@ class SVDHead(nn.Module):
         self.conv2 = nn.Conv1d(64, 1, kernel_size=1, bias=False)
         self.bn2 = nn.BatchNorm1d(1)
 
+    def sinkhorn(self, scores, n_iters):
+        # scores: (bs, k, np)
+        zero_pad = nn.ZeroPad2d((0, 1, 0, 1))
+        # scores: (bs, k+1, np)
+        scores = zero_pad(scores)
+        for i in range(n_iters):
+            # row normalization
+            scores = torch.cat((
+                    scores[:, :-1, :] - (torch.logsumexp(scores[:, :-1, :], dim=2, keepdim=True)),
+                    scores[:, -1, None, :]),  # Don't normalize last row
+                dim=1)
+            # col normalization
+            scores = torch.cat((
+                scores[:, :, :-1] - (torch.logsumexp(scores[:, :, :-1], dim=1, keepdim=True)),
+                scores[:, :, -1, None]),  # Don't normalize last row
+                dim=2)
+        # (bs, k, np)
+        scores = scores[:, :-1, :-1]
+        return scores
+
     def forward(self, *input):
         src_embedding = input[0]
         tgt_embedding = input[1]
@@ -326,11 +346,14 @@ class SVDHead(nn.Module):
         dists = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
         affinity = dists / temperature
         # (bs, np, np)
-        scores = F.softmax(affinity, dim=-1)
+        log_perm_matrix = self.sinkhorn(affinity, n_iters=5)
+        # (bs, k, np)
+        perm_matrix = torch.exp(log_perm_matrix)
+        perm_matrix_norm = perm_matrix / (torch.sum(perm_matrix, dim=2, keepdim=True) + 1e-8)
         # (bs, 3, np)
-        src_corr = torch.matmul(tgt, scores.transpose(2, 1).contiguous())
+        src_corr = torch.matmul(tgt, perm_matrix_norm.transpose(2, 1).contiguous())
         # (bs, dim, np)
-        src_corr_embedding = torch.matmul(tgt_embedding, scores.transpose(2, 1).contiguous())
+        src_corr_embedding = torch.matmul(tgt_embedding, perm_matrix_norm.transpose(2, 1).contiguous())
         embedding = torch.matmul(src_embedding.transpose(2, 1).contiguous(), src_corr_embedding) / math.sqrt(d_k)
         # (bs, 1, np)
         embedding = torch.diagonal(embedding, dim1=-2, dim2=-1).unsqueeze(1)
@@ -365,7 +388,7 @@ class SVDHead(nn.Module):
             R.append(r)
         R = torch.stack(R, dim=0).cuda()
         t = torch.matmul(-R, src_k.mean(dim=2, keepdim=True)) + src_corr_k.mean(dim=2, keepdim=True)
-        return R, t.view(batch_size, 3), scores
+        return R, t.view(batch_size, 3), perm_matrix_norm
 
 class MatchNet(nn.Module):
     def __init__(self, args):
