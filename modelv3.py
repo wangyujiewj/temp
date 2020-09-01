@@ -309,8 +309,10 @@ class SVDHead(nn.Module):
         self.reflect = nn.Parameter(torch.eye(3), requires_grad=False)
         self.reflect[2, 2] = -1
         self.my_iter = torch.ones(1)
-        self.conv1 = nn.Conv1d(self.dims*2, 1, kernel_size=1, bias=False)
-        self.bn2 = nn.BatchNorm1d(1)
+        # self.conv1 = nn.Conv1d(1, 64, kernel_size=1, bias=False)
+        # self.bn1 = nn.BatchNorm1d(64)
+        # self.conv2 = nn.Conv1d(64, 1, kernel_size=1, bias=False)
+        # self.bn2 = nn.BatchNorm1d(1)
 
     def forward(self, *input):
         src_embedding = input[0]
@@ -329,10 +331,14 @@ class SVDHead(nn.Module):
         src_corr = torch.matmul(tgt, scores.transpose(2, 1).contiguous())
         # (bs, dim, np)
         src_corr_embedding = torch.matmul(tgt_embedding, scores.transpose(2, 1).contiguous())
-        embedding = torch.cat([src_embedding, src_corr_embedding], dim=1)
+        embedding = torch.matmul(src_embedding.transpose(2, 1).contiguous(), src_corr_embedding) / math.sqrt(d_k)
         # (bs, 1, np)
-        x = self.bn2(self.conv1(embedding))
-        corr_scores = x.repeat(1, self.n_keypoints, 1)
+        embedding = torch.diagonal(embedding, dim1=-2, dim2=-1).unsqueeze(1)
+        # embedding = torch.cat([src_embedding, src_corr_embedding], dim=1)
+        # (bs, 1, np)
+        # x = self.bn1(self.conv1(embedding))
+        # x = self.bn2(self.conv2(x))
+        corr_scores = embedding.repeat(1, self.n_keypoints, 1)
         temperature = temperature.view(batch_size, 1)
         corr_scores = corr_scores.view(batch_size * self.n_keypoints, num_points)
         temperature = temperature.repeat(1, self.n_keypoints, 1).view(-1, 1)
@@ -452,7 +458,7 @@ class HMNet(nn.Module):
             # 熵值loss
             entropy_loss = self.compute_loss(src, tgt, scores, res_rotation_ab, res_translation_ab,
                                              ) * self.discount_factor ** i
-            total_loss = total_loss + loss + entropy_loss * 0.5
+            total_loss = total_loss + loss + entropy_loss * 0.2
             # 这个时候点云才会变
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         total_loss.backward()
@@ -482,7 +488,7 @@ class HMNet(nn.Module):
             # 熵值loss
             entropy_loss = self.compute_loss(src, tgt, scores, res_rotation_ab, res_translation_ab,
                                              ) * self.discount_factor ** i
-            total_loss = total_loss + loss + entropy_loss * 0.5
+            total_loss = total_loss + loss + entropy_loss * 0.2
             # 这个时候点云才会变
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         return total_loss.item(), rotation_ab_pred, translation_ab_pred
