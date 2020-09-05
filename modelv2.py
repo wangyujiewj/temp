@@ -124,13 +124,12 @@ class AttentionalPropagation(nn.Module):
     def __init__(self, feature_dim: int, num_heads: int):
         super().__init__()
         self.attn = MultiHeadedAttention(num_heads, feature_dim)
-        self.mlp = MLP([feature_dim*2, feature_dim*2, feature_dim])
+        self.mlp = MLP([feature_dim*2, feature_dim])
         nn.init.constant_(self.mlp[-1].bias, 0.0)
 
     def forward(self, x, source):
         message = self.attn(x, source, source)
         return self.mlp(torch.cat([x, message], dim=1))
-
 
 class AttentionalGNN(nn.Module):
     def __init__(self, feature_dim):
@@ -142,6 +141,37 @@ class AttentionalGNN(nn.Module):
         desc0, desc1 = (desc0 + delta0), (desc1 + delta1)
         return desc0, desc1
 
+class GSS(nn.Module):
+    def __init__(self, args):
+        super(GSS, self).__init__()
+        self.n_keypoints = args.n_keypoints
+        self.dims = args.n_emb_dims
+        self.conv1 = nn.Conv1d(2 * self.dims, 1, kernel_size=1, bias=False)
+        # output -> (0,1)
+
+    def forward(self, *input):
+        points = input[0]
+        src_embedding = input[1]
+        tgt_embedding = input[2]
+        batch_size, _, num_points = points.size()
+        temperature = input[3].view(batch_size, 1, 1)
+        # (bs, dim, np)
+        tgt_global_embedding = F.adaptive_max_pool1d(tgt_embedding, 1).expand(-1, -1, num_points)
+        # (bs, 2*dim, np)
+        embedding = torch.cat([src_embedding, tgt_global_embedding], dim=1)
+        # (bs, 1, np)
+        embedding = self.conv1(embedding)
+        # (bs, k, np)
+        scores = embedding.repeat(1, self.n_keypoints, 1)
+        temperature = temperature.view(batch_size, 1)
+        scores = scores.view(batch_size * self.n_keypoints, num_points)
+        temperature = temperature.repeat(1, self.n_keypoints, 1).view(-1, 1)
+        scores = F.gumbel_softmax(scores, tau=temperature, hard=True)
+        scores = scores.view(batch_size, self.n_keypoints, num_points)
+        new_points = torch.matmul(points, scores.transpose(2, 1).contiguous())
+        new_embedding = torch.matmul(src_embedding, scores.transpose(2, 1).contiguous())
+        return new_points, new_embedding
+
 class SVDHead(nn.Module):
     def __init__(self, args):
         super(SVDHead, self).__init__()
@@ -149,8 +179,6 @@ class SVDHead(nn.Module):
         self.reflect = nn.Parameter(torch.eye(3), requires_grad=False)
         self.reflect[2, 2] = -1
         self.my_iter = torch.ones(1)
-        self.conv1 = nn.Conv1d(2*self.n_emb_dims, 1, kernel_size=1, bias=False)
-        self.n_keypoints = args.n_keypoints
     def sinkhorn(self, scores, n_iters):
         # scores: (bs, k, np)
         zero_pad = nn.ZeroPad2d((0, 1, 0, 1))
@@ -176,33 +204,30 @@ class SVDHead(nn.Module):
         tgt_embedding = input[1]
         src = input[2]
         tgt = input[3]
-        batch_size, d_k, num_points = src_embedding.size()
+        batch_size, d_k, num_points_k = src_embedding.size()
+        num_points = tgt.shape[2]
         temperature = input[4].view(batch_size, 1, 1)
-        # (bs, np, np)
+        # (bs, k, np)
         dists = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
         affinity = dists / temperature
         log_perm_matrix = self.sinkhorn(affinity, n_iters=5)
-        # (bs, np, np)
+        # (bs, k, np)
         perm_matrix = torch.exp(log_perm_matrix)
         perm_matrix_norm = perm_matrix / (torch.sum(perm_matrix, dim=2, keepdim=True) + 1e-8)
-        # (bs, 3, np)
-        src_corr = torch.matmul(tgt, perm_matrix_norm.transpose(2, 1).contiguous())
-        # (bs, dim, np)
-        src_corr_embedding = torch.matmul(tgt_embedding, perm_matrix_norm.transpose(2, 1).contiguous())
-        # (bs, 2*dim, np)
-        embedding = torch.cat([src_embedding, src_corr_embedding], dim=1)
-        x = self.conv1(embedding)
-        corr_scores = x.repeat(1, self.n_keypoints, 1)
-        temperature = temperature.view(batch_size, 1)
-        corr_scores = corr_scores.view(batch_size * self.n_keypoints, num_points)
-        temperature = temperature.repeat(1, self.n_keypoints, 1).view(-1, 1)
-        corr_scores = F.gumbel_softmax(corr_scores, tau=temperature, hard=True)
-        # (bs, k, k)
-        corr_scores = corr_scores.view(batch_size, self.n_keypoints, num_points)
-        src_k = torch.matmul(corr_scores, src.transpose(2, 1).contiguous()).transpose(2, 1).contiguous()
-        src_corr_k = torch.matmul(corr_scores, src_corr.transpose(2, 1).contiguous()).transpose(2, 1).contiguous()
-        src_centered = src_k - src_k.mean(dim=2, keepdim=True)
-        src_corr_centered = src_corr_k - src_corr_k.mean(dim=2, keepdim=True)
+        # (bs, 3, k)
+        weighted_tgt = torch.matmul(tgt, perm_matrix_norm.transpose(2, 1).contiguous())
+        # (bs, k, 1)
+        weights = torch.sum(perm_matrix, dim=-1, keepdim=True)
+        # (bs, k, 1)
+        weights_norm = weights / (torch.sum(weights, dim=1, keepdim=True) + 1e-8)
+        # (bs, 1, k)
+        weights_norm = weights_norm.transpose(2, 1).contiguous()
+        # (bs, 3, 1)
+        src_centroid = torch.sum(torch.mul(src, weights_norm), dim=2, keepdim=True)
+        tgt_centroid = torch.sum(torch.mul(weighted_tgt, weights_norm), dim=2, keepdim=True)
+        src_centered = src - src_centroid
+        src_corr_centered = weighted_tgt - tgt_centroid
+        src_corr_centered = torch.mul(src_corr_centered, weights_norm)
         H = torch.matmul(src_centered, src_corr_centered.transpose(2, 1).contiguous()).cpu()
         R = []
         for i in range(src.size(0)):
@@ -218,9 +243,8 @@ class SVDHead(nn.Module):
             r = torch.matmul(torch.matmul(v, diag), u.transpose(1, 0)).contiguous()
             R.append(r)
         R = torch.stack(R, dim=0).cuda()
-        t = torch.matmul(-R, src_k.mean(dim=2, keepdim=True)) + src_corr_k.mean(dim=2, keepdim=True)
-        return R, t.view(batch_size, 3), src_k, src_corr_k, perm_matrix_norm
-
+        t = torch.matmul(-R, src_centroid) + tgt_centroid
+        return R, t.view(batch_size, 3), tgt, perm_matrix_norm
 
 class MatchNet(nn.Module):
     def __init__(self, args):
@@ -233,10 +257,11 @@ class MatchNet(nn.Module):
         for i in range(self.n_iters):
             layer = DGCNN(emb_dims=self.n_emb_dims)
             self.add_module('src_emb_nn_{}'.format(i), layer)
-            head = SVDHead(args)
-            self.add_module('head_{}'.format(i), head)
             attn = AttentionalGNN(feature_dim=self.n_emb_dims)
             self.add_module('attn_{}'.format(i), attn)
+            sampling = GSS(args)
+            self.add_module('sampling_{}'.format(i), sampling)
+        self.head = SVDHead(args)
 
     def forward(self, *input):
         src = input[0]
@@ -248,8 +273,9 @@ class MatchNet(nn.Module):
         src_embedding = src_emb_nn(src)
         attn = getattr(self, 'attn_{}'.format(i))
         src_embedding, tgt_embedding = attn(src_embedding, tgt_embedding)
-        head = getattr(self, 'head_{}'.format(i))
-        rotation_ab, translation_ab, src_k, tgt_k, scores = head(src_embedding, tgt_embedding, src, tgt, temp)
+        sampling = getattr(self, 'sampling_{}'.format(i))
+        src_k, src_embedding_k = sampling(src, src_embedding, tgt_embedding, temp)
+        rotation_ab, translation_ab, tgt_k, scores = self.head(src_embedding_k, tgt_embedding, src_k, tgt, temp)
         return rotation_ab, translation_ab, src_k, tgt_k, scores
 
 class HMNet(nn.Module):
@@ -277,14 +303,14 @@ class HMNet(nn.Module):
         sort_distance, sort_id = torch.sort(dists, dim=-1)
         # (bs, k, 1) 距离最近的id 设阈值小于0.1的为关键点
         TD = sort_id[:, :, 0, None]
-        # (bs, np, 1)
-        nearest_dist = sort_distance[:, :, 0, None]
+        # (bs, k, 1)
+        # nearest_dist = sort_distance[:, :, 0, None]
         S = torch.gather(-torch.log(scores + 1e-8), index=TD, dim=-1)
-        S_zeros = torch.zeros_like(S)
+        # S_zeros = torch.zeros_like(S)
         # (bs, np, 1)
-        ind_S = torch.where(nearest_dist > 0.1, S_zeros, S)
-        S = torch.mean(ind_S)
-        return S
+        # ind_S = torch.where(nearest_dist > 0.1, S_zeros, S)
+        S_loss = torch.mean(S)
+        return S_loss
 
     def _train_one_batch(self, src, tgt, rotation_ab, translation_ab, opt, temp, epoch):
         opt.zero_grad()
@@ -306,16 +332,11 @@ class HMNet(nn.Module):
             translation_ab_pred = torch.matmul(rotation_ab_pred_i, translation_ab_pred.unsqueeze(2)).squeeze(2) \
                                   + translation_ab_pred_i
             # 熵值loss
-            src_entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
-            res_rotation_ab_t = res_rotation_ab.transpose(2, 1).contiguous()
-            res_translation_ab_t = - torch.matmul(res_rotation_ab_t, res_translation_ab.unsqueeze(2)).squeeze(2)
-            tgt_entropy_loss = self.compute_loss(scores.transpose(2, 1).contiguous(), tgt, res_rotation_ab_t,
-                                                 res_translation_ab_t, src)
-            entropy_loss = src_entropy_loss + tgt_entropy_loss
+            entropy_loss = self.compute_loss(scores, src_k, res_rotation_ab, res_translation_ab, tgt)
             # 位姿loss
-            pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
-                    + F.mse_loss(translation_ab_pred, translation_ab))
-            total_loss = total_loss + entropy_loss * alpha + pose_loss * (1 - alpha)
+            # pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
+            #         + F.mse_loss(translation_ab_pred, translation_ab))
+            total_loss = total_loss + entropy_loss
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         total_loss.backward()
         opt.step()
@@ -340,16 +361,11 @@ class HMNet(nn.Module):
             translation_ab_pred = torch.matmul(rotation_ab_pred_i, translation_ab_pred.unsqueeze(2)).squeeze(2) \
                                   + translation_ab_pred_i
             # 熵值loss
-            src_entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
-            res_rotation_ab_t = res_rotation_ab.transpose(2, 1).contiguous()
-            res_translation_ab_t = - torch.matmul(res_rotation_ab_t, res_translation_ab.unsqueeze(2)).squeeze(2)
-            tgt_entropy_loss = self.compute_loss(scores.transpose(2, 1).contiguous(), tgt, res_rotation_ab_t,
-                                                 res_translation_ab_t, src)
-            entropy_loss = src_entropy_loss + tgt_entropy_loss
+            entropy_loss = self.compute_loss(scores, src_k, res_rotation_ab, res_translation_ab, tgt)
             # 位姿loss
-            pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)
-                    + F.mse_loss(translation_ab_pred, translation_ab))
-            total_loss = total_loss + entropy_loss * alpha + pose_loss * (1 - alpha)
+            # pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)
+            #         + F.mse_loss(translation_ab_pred, translation_ab))
+            total_loss = total_loss + entropy_loss
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         return total_loss.item(), rotation_ab_pred, translation_ab_pred
 
