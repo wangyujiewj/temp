@@ -71,21 +71,21 @@ class Tar_DGCNN(nn.Module):
         batch_size, num_dims, num_points = x.size()
         x = get_graph_feature(x)
         x = F.relu(self.bn1(self.conv1(x)))
-        x1 = x.sum(dim=-1, keepdim=True)[0]
+        x1 = x.sum(dim=-1, keepdim=True)
         x = F.relu(self.bn2(self.conv2(x)))
-        x2 = x.sum(dim=-1, keepdim=True)[0]
+        x2 = x.sum(dim=-1, keepdim=True)
         if i == 2:
             output_2 = torch.cat((x1, x2), dim=1)
             output_2 = F.relu(self.out_bn2(self.out_conv2(output_2))).view(batch_size, -1, num_points)
             return output_2
         x = F.relu(self.bn3(self.conv3(x)))
-        x3 = x.sum(dim=-1, keepdim=True)[0]
+        x3 = x.sum(dim=-1, keepdim=True)
         if i == 1:
             output_1 = torch.cat((x1, x2, x3), dim=1)
             output_1 = F.relu(self.out_bn1(self.out_conv1(output_1))).view(batch_size, -1, num_points)
             return output_1
         x = F.relu(self.bn4(self.conv4(x)))
-        x4 = x.sum(dim=-1, keepdim=True)[0]
+        x4 = x.sum(dim=-1, keepdim=True)
         output_0 = torch.cat((x1, x2, x3, x4), dim=1)
         output_0 = F.relu(self.out_bn0(self.out_conv0(output_0))).view(batch_size, -1, num_points)
         return output_0
@@ -108,13 +108,13 @@ class Src_DGCNN_0(nn.Module):
         batch_size, num_dims, num_points = x.size()
         x = get_graph_feature(x)
         x = F.relu(self.bn1(self.conv1(x)))
-        x1 = x.sum(dim=-1, keepdim=True)[0]
+        x1 = x.sum(dim=-1, keepdim=True)
         x = F.relu(self.bn2(self.conv2(x)))
-        x2 = x.sum(dim=-1, keepdim=True)[0]
+        x2 = x.sum(dim=-1, keepdim=True)
         x = F.relu(self.bn3(self.conv3(x)))
-        x3 = x.sum(dim=-1, keepdim=True)[0]
+        x3 = x.sum(dim=-1, keepdim=True)
         x = F.relu(self.bn4(self.conv4(x)))
-        x4 = x.sum(dim=-1, keepdim=True)[0]
+        x4 = x.sum(dim=-1, keepdim=True)
         output_0 = torch.cat((x1, x2, x3, x4), dim=1)
         output_0 = F.relu(self.out_bn0(self.out_conv0(output_0))).view(batch_size, -1, num_points)
         return output_0
@@ -135,11 +135,11 @@ class Src_DGCNN_1(nn.Module):
         batch_size, num_dims, num_points = x.size()
         x = get_graph_feature(x)
         x = F.relu(self.bn1(self.conv1(x)))
-        x1 = x.sum(dim=-1, keepdim=True)[0]
+        x1 = x.sum(dim=-1, keepdim=True)
         x = F.relu(self.bn2(self.conv2(x)))
-        x2 = x.sum(dim=-1, keepdim=True)[0]
+        x2 = x.sum(dim=-1, keepdim=True)
         x = F.relu(self.bn3(self.conv3(x)))
-        x3 = x.sum(dim=-1, keepdim=True)[0]
+        x3 = x.sum(dim=-1, keepdim=True)
         output_1 = torch.cat((x1, x2, x3), dim=1)
         output_1 = F.relu(self.out_bn1(self.out_conv1(output_1))).view(batch_size, -1, num_points)
         return output_1
@@ -158,9 +158,9 @@ class Src_DGCNN_2(nn.Module):
         batch_size, num_dims, num_points = x.size()
         x = get_graph_feature(x)
         x = F.relu(self.bn1(self.conv1(x)))
-        x1 = x.sum(dim=-1, keepdim=True)[0]
+        x1 = x.sum(dim=-1, keepdim=True)
         x = F.relu(self.bn2(self.conv2(x)))
-        x2 = x.sum(dim=-1, keepdim=True)[0]
+        x2 = x.sum(dim=-1, keepdim=True)
         output_2 = torch.cat((x1, x2), dim=1)
         output_2 = F.relu(self.out_bn2(self.out_conv2(output_2))).view(batch_size, -1, num_points)
         return output_2
