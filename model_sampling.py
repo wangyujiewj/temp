@@ -231,7 +231,7 @@ class SVDHead(nn.Module):
         self.my_iter = torch.ones(1)
         # self.conv1 = nn.Conv1d(2*self.n_emb_dims, 1, kernel_size=1, bias=False)
         self.n_keypoints = args.n_keypoints
-        
+
     def sinkhorn(self, scores, n_iters):
         # scores: (bs, k, np)
         zero_pad = nn.ZeroPad2d((0, 1, 0, 1))
@@ -277,7 +277,10 @@ class SVDHead(nn.Module):
         # weights_median = torch.median(weights, dim=1)[0].squeeze(-1)
         # for i in range(batch_size):
         #     weights[i] = torch.where(weights[i] > weights_median[i], weights[i], weights_zeros[i])
-        # (bs, k, np)
+        # (bs, 1, 1)
+        weights_mean = torch.mean(weights, dim=-1, keepdim=True)
+        weights_std = torch.std(weights, dim=-1, keepdim=True)
+        weights = (weights - weights_mean) / (weights_std + 1e-8)
         corr_scores = weights.repeat(1, self.n_keypoints, 1)
         temperature = temperature.view(batch_size, 1)
         corr_scores = corr_scores.view(batch_size * self.n_keypoints, num_points)
