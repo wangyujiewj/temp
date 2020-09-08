@@ -269,7 +269,7 @@ class SVDHead(nn.Module):
         temperature = input[4].view(batch_size, 1, 1)
         # (bs, np, np)
         dists = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
-        affinity = dists / temperature
+        affinity = dists
         # affinity = dists
         log_perm_matrix = self.sinkhorn(affinity, n_iters=5)
         # (bs, np, np)
@@ -288,6 +288,8 @@ class SVDHead(nn.Module):
         x = self.relu1(self.linear1(weights))
         # (bs, np, 1)
         x = self.linear2(x)
+        x = torch.sigmoid(x)
+        x = torch.log(x + 1e-8)
         # (bs, np, 1)
         corr_scores = x.repeat(1, self.n_keypoints, 1)
         temperature = temperature.view(batch_size, 1)
@@ -397,7 +399,7 @@ class HMNet(nn.Module):
         nearest_dist = sort_distance[:, :, 0, None]
         # (bs, np, 1)
         S_zeros = torch.zeros_like(corr_scores)
-        ind_S = torch.where(nearest_dist > 0.08, S_zeros, torch.exp(-corr_scores))
+        ind_S = torch.where(nearest_dist > 0.08, S_zeros, -corr_scores)
         dists_loss = torch.mean(ind_S)
         return dists_loss
 
