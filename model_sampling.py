@@ -217,10 +217,15 @@ class AttentionalGNN(nn.Module):
         super().__init__()
         self.layer = AttentionalPropagation(feature_dim, 4)
     def forward(self, desc0, desc1):
-        src0, src1 = desc1, desc0
-        delta0, delta1 = self.layer(desc0, src0), self.layer(desc1, src1)
-        desc0, desc1 = (desc0 + delta0), (desc1 + delta1)
-        return desc0, desc1
+        # 二分图
+        # src0, src1 = desc1, desc0
+        # delta0, delta1 = self.layer(desc0, src0), self.layer(desc1, src1)
+        # desc0, desc1 = (desc0 + delta0), (desc1 + delta1)
+        # return desc0, desc1
+        # 全连接图
+        delta0 = self.layer(desc0, desc1)
+        delta0 = delta0 + desc0
+        return delta0
 
 class SVDHead(nn.Module):
     def __init__(self, args):
@@ -229,7 +234,7 @@ class SVDHead(nn.Module):
         self.reflect = nn.Parameter(torch.eye(3), requires_grad=False)
         self.reflect[2, 2] = -1
         self.my_iter = torch.ones(1)
-        # self.conv1 = nn.Conv1d(2*self.n_emb_dims, 1, kernel_size=1, bias=False)
+        self.conv1 = nn.Conv1d(2*self.n_emb_dims, 1, kernel_size=1, bias=False)
         self.n_keypoints = args.n_keypoints
 
     def sinkhorn(self, scores, n_iters):
@@ -260,28 +265,30 @@ class SVDHead(nn.Module):
         batch_size, d_k, num_points_k = src_embedding.size()
         num_points = tgt.shape[2]
         temperature = input[4].view(batch_size, 1, 1)
-        # (bs, k, np)
+        # (bs, np, np)
         dists = torch.matmul(src_embedding.transpose(2, 1).contiguous(), tgt_embedding) / math.sqrt(d_k)
-        # affinity = dists / temperature
-        affinity = dists
+        affinity = dists / temperature
+        # affinity = dists
         log_perm_matrix = self.sinkhorn(affinity, n_iters=5)
-        # (bs, k, np)
+        # (bs, np, np)
         perm_matrix = torch.exp(log_perm_matrix)
         perm_matrix_norm = perm_matrix / (torch.sum(perm_matrix, dim=2, keepdim=True) + 1e-8)
-        # (bs, 3, k)
+        # (bs, 3, np)
         src_corr = torch.matmul(tgt, perm_matrix_norm.transpose(2, 1).contiguous())
         # (bs, 1, np) 感觉权重应该取最大值
-        weights = torch.sum(perm_matrix, dim=-1, keepdim=True).transpose(2, 1).contiguous()
+        # weights = torch.sum(perm_matrix, dim=-1, keepdim=True).transpose(2, 1).contiguous()
         # weights_zeros = torch.zeros_like(weights)
         # # 舍弃后一半的权重 (bs,)
         # weights_median = torch.median(weights, dim=1)[0].squeeze(-1)
         # for i in range(batch_size):
         #     weights[i] = torch.where(weights[i] > weights_median[i], weights[i], weights_zeros[i])
-        # (bs, 1, 1)
-        weights_mean = torch.mean(weights, dim=-1, keepdim=True)
-        weights_std = torch.std(weights, dim=-1, keepdim=True)
-        weights = (weights - weights_mean) / (weights_std + 1e-8)
-        corr_scores = weights.repeat(1, self.n_keypoints, 1)
+        # (bs, dim, np)
+        src_corr_embedding = torch.matmul(tgt_embedding, perm_matrix_norm.transpose(2, 1).contiguous())
+        # (bs, 2*dim, np)
+        embedding = torch.cat([src_embedding, src_corr_embedding], dim=1)
+        # (bs, 1, np)
+        embedding = self.conv1(embedding)
+        corr_scores = embedding.repeat(1, self.n_keypoints, 1)
         temperature = temperature.view(batch_size, 1)
         corr_scores = corr_scores.view(batch_size * self.n_keypoints, num_points)
         temperature = temperature.repeat(1, self.n_keypoints, 1).view(-1, 1)
@@ -307,7 +314,7 @@ class SVDHead(nn.Module):
             R.append(r)
         R = torch.stack(R, dim=0).cuda()
         t = torch.matmul(-R, src_k.mean(dim=2, keepdim=True)) + src_corr_k.mean(dim=2, keepdim=True)
-        return R, t.view(batch_size, 3), perm_matrix_norm
+        return R, t.view(batch_size, 3), src_k, perm_matrix_norm
 
 class MatchNet(nn.Module):
     def __init__(self, args):
@@ -324,9 +331,10 @@ class MatchNet(nn.Module):
         self.add_module('src_emb_nn_{}'.format(1), layer_1)
         self.add_module('src_emb_nn_{}'.format(2), layer_2)
         self.head = SVDHead(args=args)
+        self.tgt_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
         for i in range(self.n_iters):
             attn = AttentionalGNN(feature_dim=self.n_emb_dims)
-            self.add_module('attn_{}'.format(i), attn)
+            self.add_module('src_attn_{}'.format(i), attn)
             # head = SVDHead(args=args)
             # self.add_module('head_{}'.format(i), head)
 
@@ -338,10 +346,11 @@ class MatchNet(nn.Module):
         tgt_embedding = self.tgt_emb_nn(tgt, i)
         src_emb_nn = getattr(self, 'src_emb_nn_{}'.format(i))
         src_embedding = src_emb_nn(src)
-        attn = getattr(self, 'attn_{}'.format(i))
-        src_embedding, tgt_embedding = attn(src_embedding, tgt_embedding)
-        rotation_ab, translation_ab, scores = self.head(src_embedding, tgt_embedding, src, tgt, temp)
-        return rotation_ab, translation_ab, scores
+        tgt_embedding = self.tgt_attn(tgt_embedding, tgt_embedding)
+        src_attn = getattr(self, 'src_attn_{}'.format(i))
+        src_embedding = src_attn(src_embedding, src_embedding)
+        rotation_ab, translation_ab, src_k, scores = self.head(src_embedding, tgt_embedding, src, tgt, temp)
+        return rotation_ab, translation_ab, src_k, scores
 
 class HMNet(nn.Module):
     def __init__(self, args):
@@ -357,10 +366,10 @@ class HMNet(nn.Module):
         if torch.cuda.device_count() > 1:
             self.match_net = nn.DataParallel(self.match_net)
     def forward(self, *input):
-        rotation_ab, translation_ab, scores = self.match_net(*input)
-        return rotation_ab, translation_ab, scores
+        rotation_ab, translation_ab, src_k, scores = self.match_net(*input)
+        return rotation_ab, translation_ab, src_k, scores
 
-    def compute_loss(self, scores, src, rotation_ab, translation_ab, tgt):
+    def entropy_loss(self, scores, src, rotation_ab, translation_ab, tgt):
         src_gt = transform_point_cloud(src, rotation_ab, translation_ab)
         # view_pointclouds(src_k_gt.squeeze(0).cpu().detach().numpy().T, tgt.squeeze(0).cpu().detach().numpy().T)
         dists = pairwise_distance(src_gt, tgt)
@@ -369,11 +378,22 @@ class HMNet(nn.Module):
         # (bs, np, 1) 距离最近的id 设阈值小于0.1的为关键点
         TD = sort_id[:, :, 0, None]
         # (bs, np, 1)
-        # nearest_dist = sort_distance[:, :, 0, None]
+        nearest_dist = sort_distance[:, :, 0, None]
         # (bs, np, 1)
         S = torch.gather(-torch.log(scores + 1e-8), index=TD, dim=-1)
-        S = torch.mean(S)
-        return S
+        S_zeros = torch.zeros_like(S)
+        ind_S = torch.where(nearest_dist > 0.08, S_zeros, S)
+        S_loss = torch.mean(ind_S)
+        return S_loss
+
+    def sampling_loss(self, src_k, rotation_ab, translation_ab, tgt):
+        src_k_gt = transform_point_cloud(src_k, rotation_ab, translation_ab)
+        dists = pairwise_distance(src_k_gt, tgt)
+        sort_distance, sort_id = torch.sort(dists, dim=-1)
+        # (bs, k)
+        nearest_dist = sort_distance[:, :, 0]
+        dists_loss = torch.mean(nearest_dist)
+        return dists_loss
 
     def _train_one_batch(self, src, tgt, rotation_ab, translation_ab, opt, temp, epoch):
         opt.zero_grad()
@@ -385,7 +405,7 @@ class HMNet(nn.Module):
         temp = torch.tensor(temp).cuda().repeat(batch_size)
         alpha = float(epoch / self.total_epoch)
         for i in range(self.num_iters):
-            rotation_ab_pred_i, translation_ab_pred_i, scores = self.forward(src, tgt, temp, i)
+            rotation_ab_pred_i, translation_ab_pred_i, src_k, scores = self.forward(src, tgt, temp, i)
             # 残差位姿
             res_rotation_ab = torch.matmul(rotation_ab, rotation_ab_pred.transpose(2, 1))
             res_translation_ab = translation_ab - torch.matmul(res_rotation_ab,
@@ -395,10 +415,11 @@ class HMNet(nn.Module):
             translation_ab_pred = torch.matmul(rotation_ab_pred_i, translation_ab_pred.unsqueeze(2)).squeeze(2) \
                                   + translation_ab_pred_i
             # 熵值loss
-            entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
+            entropy_loss = self.entropy_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
             pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
                          + F.mse_loss(translation_ab_pred, translation_ab))
-            total_loss = total_loss + entropy_loss * alpha + pose_loss * (1-alpha)
+            sample_loss = self.sampling_loss(src_k, res_rotation_ab, res_translation_ab, tgt)
+            total_loss = total_loss + entropy_loss + pose_loss + sample_loss
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         total_loss.backward()
         opt.step()
@@ -413,7 +434,7 @@ class HMNet(nn.Module):
         temp = torch.tensor(temp).cuda().repeat(batch_size)
         alpha = float(epoch / self.total_epoch)
         for i in range(self.num_iters):
-            rotation_ab_pred_i, translation_ab_pred_i, scores = self.forward(src, tgt, temp, i)
+            rotation_ab_pred_i, translation_ab_pred_i, src_k, scores = self.forward(src, tgt, temp, i)
             # 残差位姿
             res_rotation_ab = torch.matmul(rotation_ab, rotation_ab_pred.transpose(2, 1))
             res_translation_ab = translation_ab - torch.matmul(res_rotation_ab,
@@ -423,10 +444,11 @@ class HMNet(nn.Module):
             translation_ab_pred = torch.matmul(rotation_ab_pred_i, translation_ab_pred.unsqueeze(2)).squeeze(2) \
                                   + translation_ab_pred_i
             # 熵值loss
-            entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
+            entropy_loss = self.entropy_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
             pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
                     + F.mse_loss(translation_ab_pred, translation_ab))
-            total_loss = total_loss + entropy_loss * alpha + pose_loss * (1-alpha)
+            sample_loss = self.sampling_loss(src_k, res_rotation_ab, res_translation_ab, tgt)
+            total_loss = total_loss + entropy_loss + pose_loss + sample_loss
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         return total_loss.item(), rotation_ab_pred, translation_ab_pred
 
