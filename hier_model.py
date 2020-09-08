@@ -216,11 +216,54 @@ class AttentionalGNN(nn.Module):
     def __init__(self, feature_dim):
         super().__init__()
         self.layer = AttentionalPropagation(feature_dim, 4)
+
     def forward(self, desc0, desc1):
-        src0, src1 = desc1, desc0
-        delta0, delta1 = self.layer(desc0, src0), self.layer(desc1, src1)
-        desc0, desc1 = (desc0 + delta0), (desc1 + delta1)
-        return desc0, desc1
+        # 二分图
+        # src0, src1 = desc1, desc0
+        # delta0, delta1 = self.layer(desc0, src0), self.layer(desc1, src1)
+        # desc0, desc1 = (desc0 + delta0), (desc1 + delta1)
+        # return desc0, desc1
+        # 全连接图
+        delta0 = self.layer(desc0, desc1)
+        delta0 = delta0 + desc0
+        return delta0
+
+class SpatialAttention(nn.Module):
+    def __init__(self, feature_dim):
+        super(SpatialAttention, self).__init__()
+        self.mlp1 = nn.Conv2d(feature_dim, feature_dim, kernel_size=1, bias=True)
+        self.mlp2 = nn.Conv2d(feature_dim, feature_dim, kernel_size=1, bias=True)
+        self.mlp3 = nn.Conv2d(2, 1, kernel_size=1, bias=True)
+        self.bn1 = nn.BatchNorm2d(feature_dim)
+        self.bn2 = nn.BatchNorm2d(feature_dim)
+        self.bn3 = nn.BatchNorm2d(1)
+    # (bs, dim, np)
+    def forward(self, embedding):
+        # (bs, dim, np, 1)
+        embedding = embedding.unsqueeze(-1)
+        # (bs, dim, 1, 1)
+        maxpool_channel = torch.max(embedding, dim=2, keepdim=True)[0]
+        avgpool_channel = torch.mean(embedding, dim=2, keepdim=True)
+        mlp_1_max = F.relu(self.bn1(self.mlp1(maxpool_channel)))
+        mlp_2_max = F.relu(self.bn2(self.mlp2(mlp_1_max)))
+        mlp_1_avg = F.relu(self.bn1(self.mlp1(avgpool_channel)))
+        mlp_2_avg = F.relu(self.bn2(self.mlp2(mlp_1_avg)))
+        channel_atten = torch.sigmoid(mlp_2_avg + mlp_2_max)
+        # (bs, dim, np, 1)
+        channel_refined_output = embedding * channel_atten
+        # (bs, 1, np, 1)
+        maxpool_spatial = torch.max(embedding, dim=1, keepdim=True)[0]
+        avgpool_spatial = torch.mean(embedding, dim=1, keepdim=True)
+        # (bs, 2, np, 1)
+        max_avg_spatial = torch.cat([maxpool_spatial, avgpool_spatial], dim=1)
+        # (bs, 1, np, 1)
+        conv_layer = F.relu(self.bn3(self.mlp3(max_avg_spatial)))
+        spatial_attention = torch.sigmoid(conv_layer)
+        output = channel_refined_output * spatial_attention
+        # (bs, dim, np, 1)
+        output = output.squeeze(-1)
+        # (bs, dim, np)
+        return output
 
 class SVDHead(nn.Module):
     def __init__(self, args):
@@ -268,8 +311,13 @@ class SVDHead(nn.Module):
         # (bs, 3, k)
         weighted_tgt = torch.matmul(tgt, perm_matrix_norm.transpose(2, 1).contiguous())
         # (bs, k, 1)
-        weights = torch.sum(perm_matrix, dim=-1, keepdim=True)
-        # (bs, k, 1)
+        weights = torch.max(perm_matrix, dim=-1, keepdim=True)[0]
+        # weights_zeros = torch.zeros_like(weights)
+        # # 舍弃后一半的权重 (bs,)
+        # weights_median = torch.median(weights, dim=1)[0].squeeze(-1)
+        # for i in range(batch_size):
+        #     weights[i] = torch.where(weights[i] > weights_median[i], weights[i], weights_zeros[i])
+        # (bs, k, 1) 主要靠权重选出正确的对应关系
         weights_norm = weights / (torch.sum(weights, dim=1, keepdim=True) + 1e-8)
         # (bs, 1, k)
         weights_norm = weights_norm.transpose(2, 1).contiguous()
@@ -312,9 +360,13 @@ class MatchNet(nn.Module):
         self.add_module('src_emb_nn_{}'.format(1), layer_1)
         self.add_module('src_emb_nn_{}'.format(2), layer_2)
         self.head = SVDHead(args=args)
+        # self.tgt_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
+        self.tgt_cs_attn = SpatialAttention(feature_dim=self.n_emb_dims)
         for i in range(self.n_iters):
-            attn = AttentionalGNN(feature_dim=self.n_emb_dims)
-            self.add_module('attn_{}'.format(i), attn)
+            # attn = AttentionalGNN(feature_dim=self.n_emb_dims)
+            # self.add_module('src_attn_{}'.format(i), attn)
+            cs_attn = SpatialAttention(feature_dim=self.n_emb_dims)
+            self.add_module('src_cs_attn_{}'.format(i), cs_attn)
 
     def forward(self, *input):
         src = input[0]
@@ -323,9 +375,16 @@ class MatchNet(nn.Module):
         i = input[3]
         tgt_embedding = self.tgt_emb_nn(tgt, i)
         src_emb_nn = getattr(self, 'src_emb_nn_{}'.format(i))
-        src_embedding = src_emb_nn(tgt)
-        attn = getattr(self, 'attn_{}'.format(i))
-        src_embedding, tgt_embedding = attn(src_embedding, tgt_embedding)
+        src_embedding = src_emb_nn(src)
+
+        # src_attn = getattr(self, 'src_attn_{}'.format(i))
+        # src_embedding = src_attn(src_embedding, src_embedding)
+        # tgt_embedding = self.tgt_attn(tgt_embedding, tgt_embedding)
+
+        src_cs_attn = getattr(self, 'src_cs_attn_{}'.format(i))
+        src_embedding = src_cs_attn(src_embedding)
+        tgt_embedding = self.tgt_cs_attn(tgt_embedding)
+
         rotation_ab, translation_ab, scores = self.head(src_embedding, tgt_embedding, src, tgt, temp)
         return rotation_ab, translation_ab, scores
 
@@ -357,8 +416,10 @@ class HMNet(nn.Module):
         # nearest_dist = sort_distance[:, :, 0, None]
         # (bs, np, 1)
         S = torch.gather(-torch.log(scores + 1e-8), index=TD, dim=-1)
-        S = torch.mean(S)
-        return S
+        # S_zeros = torch.zeros_like(S)
+        # ind_S = torch.where(nearest_dist > 0.08, S_zeros, S)
+        S_loss = torch.mean(S)
+        return S_loss
 
     def _train_one_batch(self, src, tgt, rotation_ab, translation_ab, opt, temp):
         opt.zero_grad()
@@ -380,6 +441,8 @@ class HMNet(nn.Module):
                                   + translation_ab_pred_i
             # 熵值loss
             entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
+            # pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
+            #              + F.mse_loss(translation_ab_pred, translation_ab))
             total_loss = total_loss + entropy_loss
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         total_loss.backward()
@@ -405,6 +468,8 @@ class HMNet(nn.Module):
                                   + translation_ab_pred_i
             # 熵值loss
             entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
+            # pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
+            #              + F.mse_loss(translation_ab_pred, translation_ab))
             total_loss = total_loss + entropy_loss
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         return total_loss.item(), rotation_ab_pred, translation_ab_pred
