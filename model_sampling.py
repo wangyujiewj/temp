@@ -234,7 +234,9 @@ class SVDHead(nn.Module):
         self.reflect = nn.Parameter(torch.eye(3), requires_grad=False)
         self.reflect[2, 2] = -1
         self.my_iter = torch.ones(1)
-        self.conv1 = nn.Conv1d(2*self.n_emb_dims, 1, kernel_size=1, bias=False)
+        self.linear1 = nn.Linear(1, 64)
+        self.relu1 = nn.ReLU()
+        self.linear2 = nn.Linear(64, 1)
         self.n_keypoints = args.n_keypoints
 
     def sinkhorn(self, scores, n_iters):
@@ -275,20 +277,19 @@ class SVDHead(nn.Module):
         perm_matrix_norm = perm_matrix / (torch.sum(perm_matrix, dim=2, keepdim=True) + 1e-8)
         # (bs, 3, np)
         src_corr = torch.matmul(tgt, perm_matrix_norm.transpose(2, 1).contiguous())
-        # (bs, 1, np) 感觉权重应该取最大值
-        # weights = torch.sum(perm_matrix, dim=-1, keepdim=True).transpose(2, 1).contiguous()
+        # (bs, np, 1) 感觉待采样的权重应该取最大值
+        weights = torch.sum(perm_matrix, dim=-1, keepdim=True)
         # weights_zeros = torch.zeros_like(weights)
         # # 舍弃后一半的权重 (bs,)
         # weights_median = torch.median(weights, dim=1)[0].squeeze(-1)
         # for i in range(batch_size):
         #     weights[i] = torch.where(weights[i] > weights_median[i], weights[i], weights_zeros[i])
-        # (bs, dim, np)
-        src_corr_embedding = torch.matmul(tgt_embedding, perm_matrix_norm.transpose(2, 1).contiguous())
-        # (bs, 2*dim, np)
-        embedding = torch.cat([src_embedding, src_corr_embedding], dim=1)
-        # (bs, 1, np)
-        embedding = self.conv1(embedding)
-        corr_scores = embedding.repeat(1, self.n_keypoints, 1)
+        # (bs, np, 64)
+        x = self.relu1(self.linear1(weights))
+        # (bs, np, 1)
+        x = self.linear2(x)
+        # (bs, np, 1)
+        corr_scores = x.repeat(1, self.n_keypoints, 1)
         temperature = temperature.view(batch_size, 1)
         corr_scores = corr_scores.view(batch_size * self.n_keypoints, num_points)
         temperature = temperature.repeat(1, self.n_keypoints, 1).view(-1, 1)
@@ -314,7 +315,7 @@ class SVDHead(nn.Module):
             R.append(r)
         R = torch.stack(R, dim=0).cuda()
         t = torch.matmul(-R, src_k.mean(dim=2, keepdim=True)) + src_corr_k.mean(dim=2, keepdim=True)
-        return R, t.view(batch_size, 3), src_k, perm_matrix_norm
+        return R, t.view(batch_size, 3), perm_matrix_norm, x
 
 class MatchNet(nn.Module):
     def __init__(self, args):
@@ -349,8 +350,8 @@ class MatchNet(nn.Module):
         tgt_embedding = self.tgt_attn(tgt_embedding, tgt_embedding)
         src_attn = getattr(self, 'src_attn_{}'.format(i))
         src_embedding = src_attn(src_embedding, src_embedding)
-        rotation_ab, translation_ab, src_k, scores = self.head(src_embedding, tgt_embedding, src, tgt, temp)
-        return rotation_ab, translation_ab, src_k, scores
+        rotation_ab, translation_ab, scores, corr_scores = self.head(src_embedding, tgt_embedding, src, tgt, temp)
+        return rotation_ab, translation_ab, scores, corr_scores
 
 class HMNet(nn.Module):
     def __init__(self, args):
@@ -366,8 +367,8 @@ class HMNet(nn.Module):
         if torch.cuda.device_count() > 1:
             self.match_net = nn.DataParallel(self.match_net)
     def forward(self, *input):
-        rotation_ab, translation_ab, src_k, scores = self.match_net(*input)
-        return rotation_ab, translation_ab, src_k, scores
+        rotation_ab, translation_ab, scores, corr_scores = self.match_net(*input)
+        return rotation_ab, translation_ab, scores, corr_scores
 
     def entropy_loss(self, scores, src, rotation_ab, translation_ab, tgt):
         src_gt = transform_point_cloud(src, rotation_ab, translation_ab)
@@ -386,13 +387,18 @@ class HMNet(nn.Module):
         S_loss = torch.mean(ind_S)
         return S_loss
 
-    def sampling_loss(self, src_k, rotation_ab, translation_ab, tgt):
-        src_k_gt = transform_point_cloud(src_k, rotation_ab, translation_ab)
-        dists = pairwise_distance(src_k_gt, tgt)
+    def sampling_loss(self, src, rotation_ab, translation_ab, tgt, corr_scores):
+        src_gt = transform_point_cloud(src, rotation_ab, translation_ab)
+        dists = pairwise_distance(src_gt, tgt)
         sort_distance, sort_id = torch.sort(dists, dim=-1)
-        # (bs, k)
-        nearest_dist = sort_distance[:, :, 0]
-        dists_loss = torch.mean(nearest_dist)
+        # (bs, np, 1)
+        TD = sort_id[:, :, 0, None]
+        # (bs, np, 1)
+        nearest_dist = sort_distance[:, :, 0, None]
+        # (bs, np, 1)
+        S_zeros = torch.zeros_like(corr_scores)
+        ind_S = torch.where(nearest_dist > 0.08, S_zeros, torch.exp(-corr_scores))
+        dists_loss = torch.mean(ind_S)
         return dists_loss
 
     def _train_one_batch(self, src, tgt, rotation_ab, translation_ab, opt, temp, epoch):
@@ -405,7 +411,7 @@ class HMNet(nn.Module):
         temp = torch.tensor(temp).cuda().repeat(batch_size)
         alpha = float(epoch / self.total_epoch)
         for i in range(self.num_iters):
-            rotation_ab_pred_i, translation_ab_pred_i, src_k, scores = self.forward(src, tgt, temp, i)
+            rotation_ab_pred_i, translation_ab_pred_i, scores, corr_scores = self.forward(src, tgt, temp, i)
             # 残差位姿
             res_rotation_ab = torch.matmul(rotation_ab, rotation_ab_pred.transpose(2, 1))
             res_translation_ab = translation_ab - torch.matmul(res_rotation_ab,
@@ -418,7 +424,7 @@ class HMNet(nn.Module):
             entropy_loss = self.entropy_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
             pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
                          + F.mse_loss(translation_ab_pred, translation_ab))
-            sample_loss = self.sampling_loss(src_k, res_rotation_ab, res_translation_ab, tgt)
+            sample_loss = self.sampling_loss(src, res_rotation_ab, res_translation_ab, tgt, corr_scores)
             total_loss = total_loss + entropy_loss + pose_loss + sample_loss
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         total_loss.backward()
@@ -434,7 +440,7 @@ class HMNet(nn.Module):
         temp = torch.tensor(temp).cuda().repeat(batch_size)
         alpha = float(epoch / self.total_epoch)
         for i in range(self.num_iters):
-            rotation_ab_pred_i, translation_ab_pred_i, src_k, scores = self.forward(src, tgt, temp, i)
+            rotation_ab_pred_i, translation_ab_pred_i, scores, corr_scores = self.forward(src, tgt, temp, i)
             # 残差位姿
             res_rotation_ab = torch.matmul(rotation_ab, rotation_ab_pred.transpose(2, 1))
             res_translation_ab = translation_ab - torch.matmul(res_rotation_ab,
@@ -447,7 +453,7 @@ class HMNet(nn.Module):
             entropy_loss = self.entropy_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
             pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
                     + F.mse_loss(translation_ab_pred, translation_ab))
-            sample_loss = self.sampling_loss(src_k, res_rotation_ab, res_translation_ab, tgt)
+            sample_loss = self.sampling_loss(src, res_rotation_ab, res_translation_ab, tgt, corr_scores)
             total_loss = total_loss + entropy_loss + pose_loss + sample_loss
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         return total_loss.item(), rotation_ab_pred, translation_ab_pred
