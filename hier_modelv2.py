@@ -30,7 +30,7 @@ def knn(x, k=20):
     idx = distance.sort(descending=True, dim=-1)[1]  # (batch_size, num_points, k)
     return idx[:, :, :k]
 
-def get_graph_feature(x, idx=None, k=20):
+def get_graph_feature(x, idx=None, k=20, bool_GAPNet=False):
     # x = x.squeeze(-1)
     x = x.view(*x.size()[:3])
     if idx is None:
@@ -39,12 +39,16 @@ def get_graph_feature(x, idx=None, k=20):
     device = torch.device('cuda')
     idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
     idx = idx + idx_base
+    # 索引数组
     idx = idx.view(-1)
     _, num_dims, _ = x.size()
     x = x.transpose(2,
                     1).contiguous()  # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
     feature = x.view(batch_size * num_points, -1)[idx, :]
+    # 按照原始数组展开
     feature = feature.view(batch_size, num_points, k, num_dims)
+    if bool_GAPNet is True:
+        return feature.permute(0, 3, 1, 2)
     x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
     feature = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2)
     return feature
@@ -60,8 +64,8 @@ class Tar_DGCNN(nn.Module):
         self.bn2 = nn.BatchNorm2d(64)
         self.bn3 = nn.BatchNorm2d(128)
         self.bn4 = nn.BatchNorm2d(256)
-        self.out_conv2 = nn.Conv2d(128, emb_dims, kernel_size=1, bias=False)
-        self.out_bn2 = nn.BatchNorm2d(emb_dims)
+        self.out_conv2 = nn.Conv2d(128, emb_dims//4, kernel_size=1, bias=False)
+        self.out_bn2 = nn.BatchNorm2d(emb_dims//4)
         self.out_conv1 = nn.Conv2d(256, emb_dims, kernel_size=1, bias=False)
         self.out_bn1 = nn.BatchNorm2d(emb_dims)
         self.out_conv0 = nn.Conv2d(512, emb_dims, kernel_size=1, bias=False)
@@ -151,8 +155,8 @@ class Src_DGCNN_2(nn.Module):
         self.conv2 = nn.Conv2d(64, 64, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.bn2 = nn.BatchNorm2d(64)
-        self.out_conv2 = nn.Conv2d(128, emb_dims, kernel_size=1, bias=False)
-        self.out_bn2 = nn.BatchNorm2d(emb_dims)
+        self.out_conv2 = nn.Conv2d(128, emb_dims//4, kernel_size=1, bias=False)
+        self.out_bn2 = nn.BatchNorm2d(emb_dims//4)
 
     def forward(self, x):
         batch_size, num_dims, num_points = x.size()
@@ -229,6 +233,56 @@ class AttentionalGNN(nn.Module):
             delta0 = delta0 + desc0
             return delta0
 
+class GAPNet(nn.Module):
+    def __init__(self, feature_dim):
+        super(GAPNet, self).__init__()
+        for i in range(4):
+            head = SingleHead(feature_dim)
+            self.add_module('head_{}'.format(i), head)
+    def forward(self, embedding):
+        feature_list = []
+        for i in range(4):
+            head = getattr(self, 'head_{}'.format(i))
+            feature = head(embedding)
+            feature_list.append(feature)
+        features = torch.cat(feature_list, dim=1)
+        return features
+
+class SingleHead(nn.Module):
+    def __init__(self, feature_dim):
+        super(SingleHead, self).__init__()
+        self.conv1 = nn.Conv2d(feature_dim, feature_dim, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv2d(feature_dim, 1, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(feature_dim)
+        self.bn2 = nn.BatchNorm2d(1)
+
+        self.conv3 = nn.Conv1d(feature_dim, feature_dim, kernel_size=1, bias=False)
+        self.conv4 = nn.Conv1d(feature_dim, 1, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm1d(feature_dim)
+        self.bn4 = nn.BatchNorm1d(1)
+    # (bs, dims, np)
+    def forward(self, embedding):
+        # (bs, dims, np, k)
+        adjacent_feature = get_graph_feature(embedding, bool_GAPNet=True)
+        # (bs, dims, np, k)
+        adjacent_feature = F.leaky_relu(self.bn1(self.conv1(adjacent_feature)))
+        # (bs, 1, np, k)
+        adjacent_coff = F.leaky_relu(self.bn2(self.conv2(adjacent_feature)))
+        # (bs, dims, np)
+        point_feature = F.leaky_relu(self.bn3(self.conv3(embedding)))
+        # (bs, 1, np, 1)
+        point_coff = F.leaky_relu(self.bn4(self.conv4(point_feature))).unsqueeze(-1)
+        # (bs, 1, np, k)
+        coff = F.leaky_relu(adjacent_coff + point_coff)
+        coff = F.softmax(coff, dim=-1)
+        # (bs, np, 1, k)
+        coff = coff.transpose(2, 1).contiguous()
+        # (bs, np, k, dim)
+        adjacent_feature = adjacent_feature.permute(0, 2, 3, 1)
+        # (bs, np, dim)
+        features = F.relu(torch.matmul(coff, adjacent_feature)).squeeze(2)
+        # (bs, dim, np)
+        return features.transpose(2, 1).contiguous()
 
 class SVDHead(nn.Module):
     def __init__(self, args):
@@ -329,7 +383,10 @@ class MatchNet(nn.Module):
         for i in range(self.n_iters - 1):
             attn = AttentionalGNN(feature_dim=self.n_emb_dims)
             self.add_module('src_attn_{}'.format(i), attn)
-        self.share_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
+        # self.share_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
+        self.src_GAPNet = GAPNet(feature_dim=self.n_emb_dims//4)
+        self.tgt_GAPNet = GAPNet(feature_dim=self.n_emb_dims//4)
+
     def forward(self, *input):
         src = input[0]
         tgt = input[1]
@@ -343,7 +400,8 @@ class MatchNet(nn.Module):
             src_embedding = src_attn(src_embedding, src_embedding)
             tgt_embedding = self.tgt_attn(tgt_embedding, tgt_embedding)
         else:
-            src_embedding, tgt_embedding = self.share_attn(src_embedding, tgt_embedding, True)
+            src_embedding = self.src_GAPNet(src_embedding)
+            tgt_embedding = self.tgt_GAPNet(tgt_embedding)
         rotation_ab, translation_ab, scores = self.head(src_embedding, tgt_embedding, src, tgt, temp)
         return rotation_ab, translation_ab, scores
 
@@ -375,9 +433,9 @@ class HMNet(nn.Module):
         nearest_dist = sort_distance[:, :, 0, None]
         # (bs, np, 1)
         S = torch.gather(-torch.log(scores + 1e-8), index=TD, dim=-1)
-        # S_zeros = torch.zeros_like(S)
-        # ind_S = torch.where(nearest_dist > 0.08, S_zeros, S)
-        S_loss = torch.mean(S)
+        S_zeros = torch.zeros_like(S)
+        ind_S = torch.where(nearest_dist > 0.08, S_zeros, S)
+        S_loss = torch.mean(ind_S)
         return S_loss
 
     def _train_one_batch(self, src, tgt, rotation_ab, translation_ab, opt, temp):
@@ -400,7 +458,9 @@ class HMNet(nn.Module):
                                   + translation_ab_pred_i
             # 熵值loss
             entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
-            total_loss = total_loss + entropy_loss
+            pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
+                         + F.mse_loss(translation_ab_pred, translation_ab))
+            total_loss = total_loss + entropy_loss + pose_loss
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         total_loss.backward()
         opt.step()
@@ -425,7 +485,9 @@ class HMNet(nn.Module):
                                   + translation_ab_pred_i
             # 熵值loss
             entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
-            total_loss = total_loss + entropy_loss
+            pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
+                         + F.mse_loss(translation_ab_pred, translation_ab))
+            total_loss = total_loss + entropy_loss + pose_loss
             src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
         return total_loss.item(), rotation_ab_pred, translation_ab_pred
 
