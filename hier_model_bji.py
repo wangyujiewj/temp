@@ -329,39 +329,34 @@ class SVDHead(nn.Module):
         # (bs, np)
         weights_value, weights_col = torch.max(perm_matrix, dim=-2)
         tgt_idx = torch.arange(tgt_num_points).cuda()
-        bji_tgt_list = []
-        bji_src_list = []
-        weights_list = []
+        R = []
+        src_centroid_array = []
+        tgt_centroid_array = []
         for bs in range(batch_size):
             a = weights_row[bs, weights_col[bs]] == tgt_idx
             idx = torch.nonzero(a).squeeze(-1)
+            # (3, k)
             bji_tgt = weighted_tgt[bs, :, idx]
             bji_src = src[bs, :, weights_col[bs, idx]]
-            weights = weights_value[bs, idx]
-            weights_list.append(weights)
-            bji_tgt_list.append(bji_tgt)
-            bji_src_list.append(bji_src)
-        src = torch.stack(bji_tgt_list, dim=0)
-        weighted_tgt = torch.stack(bji_src_list, dim=0)
-        weights = torch.stack(weights_list, dim=0).unsqueeze(-1)
-        # weights_zeros = torch.zeros_like(weights)
-        # (bs, k, 1)
-        weights_norm = weights / (torch.sum(weights, dim=1, keepdim=True) + 1e-8)
-        # (bs, 1, k)
-        weights_norm = weights_norm.transpose(2, 1).contiguous()
-        # (bs, 3, 1)
-        src_centroid = torch.sum(torch.mul(src, weights_norm), dim=2, keepdim=True)
-        tgt_centroid = torch.sum(torch.mul(weighted_tgt, weights_norm), dim=2, keepdim=True)
-        src_centered = src - src_centroid
-        src_corr_centered = weighted_tgt - tgt_centroid
-        src_corr_centered = torch.mul(src_corr_centered, weights_norm)
-        H = torch.matmul(src_centered, src_corr_centered.transpose(2, 1).contiguous()).cpu()
-        R = []
-        for i in range(src.size(0)):
+            # (k, 1)
+            weights = weights_value[bs, idx].unsqueeze(-1)
+            # (k, 1)
+            weights_norm = weights / (torch.sum(weights, dim=0, keepdim=True) + 1e-8)
+            # (1, k)
+            weights_norm = weights_norm.transpose(1, 0).contiguous()
+            # (3, 1)
+            src_centroid = torch.sum(torch.mul(bji_src, weights_norm), dim=1, keepdim=True)
+            tgt_centroid = torch.sum(torch.mul(bji_tgt, weights_norm), dim=1, keepdim=True)
+            src_centroid_array.append(src_centroid)
+            tgt_centroid_array.append(tgt_centroid)
+            src_centered = bji_src - src_centroid
+            src_corr_centered = bji_tgt - tgt_centroid
+            src_corr_centered = torch.mul(src_corr_centered, weights_norm)
+            H = torch.matmul(src_centered, src_corr_centered.transpose(1, 0).contiguous()).cpu()
             try:
-                u, s, v = torch.svd(H[i])
+                u, s, v = torch.svd(H)
             except:
-                print(H[i])
+                print(H)
             r = torch.matmul(v, u.transpose(1, 0)).contiguous()
             r_det = torch.det(r).item()
             diag = torch.from_numpy(np.array([[1.0, 0, 0],
@@ -369,6 +364,14 @@ class SVDHead(nn.Module):
                                               [0, 0, r_det]]).astype('float32')).to(v.device)
             r = torch.matmul(torch.matmul(v, diag), u.transpose(1, 0)).contiguous()
             R.append(r)
+        # 必须保证关键点数量一样
+        # src = torch.stack(bji_tgt_list, dim=0)
+        # weighted_tgt = torch.stack(bji_src_list, dim=0)
+        # weights = torch.stack(weights_list, dim=0).unsqueeze(-1)
+        # weights_zeros = torch.zeros_like(weights)
+        # (bs, 3, 1)
+        src_centroid = torch.stack(src_centroid_array, dim=0).cuda()
+        tgt_centroid = torch.stack(tgt_centroid_array, dim=0).cuda()
         R = torch.stack(R, dim=0).cuda()
         t = torch.matmul(-R, src_centroid) + tgt_centroid
         return R, t.view(batch_size, 3), perm_matrix_norm
