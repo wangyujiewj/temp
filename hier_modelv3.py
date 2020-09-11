@@ -56,18 +56,32 @@ def get_graph_feature(x, idx=None, k=20, bool_GAPNet=False):
 class GACLayer(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(GACLayer, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.out_conv = nn.Conv1d(192, out_channels, kernel_size=1, bias=False)
+        self.out_bn = nn.BatchNorm1d(out_channels)
+
     def forward(self, x):
+        batch_size, num_dims, num_points = x.size()
         # (bs, 6, np, k)  结合邻接特征差异与自身节点
-        adj_x = get_graph_feature(x)
+        x = get_graph_feature(x)
         # (bs, dim, np, k)
-        adj_x = F.relu(self.bn1(self.conv1(adj_x)))
+        x = F.relu(self.bn1(self.conv1(x)))
         # (bs, dim, np, k)
-        attn_x = F.softmax(adj_x, dim=-1)
+        attn_x = F.softmax(x, dim=-1)
         # (bs, dim, np)
-        feature = torch.sum(torch.mul(adj_x, attn_x), dim=-1)
-        return feature
+        x1 = torch.sum(torch.mul(x, attn_x), dim=-1)
+
+        x = F.relu(self.bn2(self.conv2(x)))
+        attn_x = F.softmax(x, dim=-1)
+        x2 = torch.sum(torch.mul(x, attn_x), dim=-1)
+
+        output = torch.cat((x1, x2), dim=1)
+        output = F.relu(self.out_bn(self.out_conv(output))).view(batch_size, -1, num_points)
+
+        return output
 
 class Tar_DGCNN(nn.Module):
     def __init__(self, emb_dims=512):
@@ -76,8 +90,7 @@ class Tar_DGCNN(nn.Module):
         self.conv2 = nn.Conv2d(64, 64, kernel_size=1, bias=False)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
         self.conv4 = nn.Conv2d(128, 256, kernel_size=1, bias=False)
-        self.gac0 = GACLayer(6, 64)
-        self.gac1 = GACLayer(128, 128)
+        self.gac = GACLayer(6, emb_dims//2)
         self.bn1 = nn.BatchNorm2d(64)
         self.bn2 = nn.BatchNorm2d(64)
         self.bn3 = nn.BatchNorm2d(128)
@@ -93,11 +106,7 @@ class Tar_DGCNN(nn.Module):
         batch_size, num_dims, num_points = x.size()
         # fine-tune relative pose
         if i == 2:
-            x1 = self.gac0(x)
-            x2 = self.gac1(x1)
-            output_2 = torch.cat((x1, x2), dim=1)
-            output_2 = F.relu(self.out_bn2(self.out_conv2(output_2))).view(batch_size, -1, num_points)
-            return output_2
+            return self.gac(x)
         x = get_graph_feature(x)
         x = F.relu(self.bn1(self.conv1(x)))
         x1 = x.max(dim=-1, keepdim=True)[0]
@@ -169,21 +178,21 @@ class Src_DGCNN_1(nn.Module):
         output_1 = F.relu(self.out_bn1(self.out_conv1(output_1))).view(batch_size, -1, num_points)
         return output_1
 
-class Src_DGCNN_2(nn.Module):
-    def __init__(self, emb_dims=512):
-        super(Src_DGCNN_2, self).__init__()
-        self.gac0 = GACLayer(6, 64)
-        self.gac1 = GACLayer(128, 128)
-        self.out_conv2 = nn.Conv1d(192, emb_dims, kernel_size=1, bias=False)
-        self.out_bn2 = nn.BatchNorm1d(emb_dims)
-
-    def forward(self, x):
-        batch_size, num_dims, num_points = x.size()
-        x1 = self.gac0(x)
-        x2 = self.gac1(x1)
-        output_2 = torch.cat((x1, x2), dim=1)
-        output_2 = F.relu(self.out_bn2(self.out_conv2(output_2))).view(batch_size, -1, num_points)
-        return output_2
+# class Src_DGCNN_2(nn.Module):
+#     def __init__(self, emb_dims=512):
+#         super(Src_DGCNN_2, self).__init__()
+#         self.gac0 = GACLayer(6, 64)
+#         self.gac1 = GACLayer(128, 128)
+#         self.out_conv2 = nn.Conv1d(192, emb_dims, kernel_size=1, bias=False)
+#         self.out_bn2 = nn.BatchNorm1d(emb_dims)
+#
+#     def forward(self, x):
+#         batch_size, num_dims, num_points = x.size()
+#         x1 = self.gac0(x)
+#         x2 = self.gac1(x1)
+#         output_2 = torch.cat((x1, x2), dim=1)
+#         output_2 = F.relu(self.out_bn2(self.out_conv2(output_2))).view(batch_size, -1, num_points)
+#         return output_2
 
 def attention(query, key, value):
     dim = query.shape[1]
@@ -334,15 +343,22 @@ class MatchNet(nn.Module):
         self.tgt_emb_nn = Tar_DGCNN(emb_dims=self.n_emb_dims)
         layer_0 = Src_DGCNN_0(emb_dims=self.n_emb_dims)
         layer_1 = Src_DGCNN_1(emb_dims=self.n_emb_dims)
-        layer_2 = Src_DGCNN_2(emb_dims=self.n_emb_dims)
+        layer_2 = GACLayer(in_channels=6, out_channels=self.n_emb_dims // 2)
         self.add_module('src_emb_nn_{}'.format(0), layer_0)
         self.add_module('src_emb_nn_{}'.format(1), layer_1)
         self.add_module('src_emb_nn_{}'.format(2), layer_2)
         self.head = SVDHead(args=args)
-        self.tgt_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
         for i in range(self.n_iters):
-            attn = AttentionalGNN(feature_dim=self.n_emb_dims)
-            self.add_module('src_attn_{}'.format(i), attn)
+            if i == self.n_iters - 1:
+                src_attn = AttentionalGNN(feature_dim=self.n_emb_dims // 2)
+                self.add_module('src_attn_{}'.format(i), src_attn)
+                tgt_attn = AttentionalGNN(feature_dim=self.n_emb_dims // 2)
+                self.add_module('tgt_attn_{}'.format(i), tgt_attn)
+            else:
+                src_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
+                self.add_module('src_attn_{}'.format(i), src_attn)
+                tgt_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
+                self.add_module('tgt_attn_{}'.format(i), tgt_attn)
         # self.share_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
 
     def forward(self, *input):
@@ -354,8 +370,9 @@ class MatchNet(nn.Module):
         src_emb_nn = getattr(self, 'src_emb_nn_{}'.format(i))
         src_embedding = src_emb_nn(src)
         src_attn = getattr(self, 'src_attn_{}'.format(i))
+        tgt_attn = getattr(self, 'tgt_attn_{}'.format(i))
         src_embedding = src_attn(src_embedding, src_embedding)
-        tgt_embedding = self.tgt_attn(tgt_embedding, tgt_embedding)
+        tgt_embedding = tgt_attn(tgt_embedding, tgt_embedding)
         rotation_ab, translation_ab, scores = self.head(src_embedding, tgt_embedding, src, tgt, temp)
         return rotation_ab, translation_ab, scores
 
@@ -455,9 +472,9 @@ class HMNet(nn.Module):
         translations_ab_pred = []
         eulers_ab = []
         num_examples = 0
-        if epoch < 10:
+        if epoch < 15:
             self.num_iters = 1
-        elif epoch >=10 and epoch < 20:
+        elif epoch >=15 and epoch < 30:
             self.num_iters = 2
         else:
             self.num_iters = 3
@@ -520,9 +537,9 @@ class HMNet(nn.Module):
         translations_ab_pred = []
         eulers_ab = []
         num_examples = 0
-        if epoch < 10:
+        if epoch < 15:
             self.num_iters = 1
-        elif epoch >=10 and epoch < 20:
+        elif epoch >= 15 and epoch < 30:
             self.num_iters = 2
         else:
             self.num_iters = 3
