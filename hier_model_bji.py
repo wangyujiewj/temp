@@ -321,7 +321,7 @@ class SVDHead(nn.Module):
         perm_matrix = torch.exp(log_perm_matrix)
         perm_matrix_norm = perm_matrix / (torch.sum(perm_matrix, dim=2, keepdim=True) + 1e-8)
         # (bs, 3, np)
-        weighted_tgt = torch.matmul(tgt, perm_matrix_norm.transpose(2, 1).contiguous())
+        # weighted_tgt = torch.matmul(tgt, perm_matrix_norm.transpose(2, 1).contiguous())
         # (bs, np, 1)
         # weights = torch.max(perm_matrix, dim=-1, keepdim=True)[0]
         # (bs, np)
@@ -336,7 +336,7 @@ class SVDHead(nn.Module):
             a = weights_row[bs, weights_col[bs]] == tgt_idx
             idx = torch.nonzero(a).squeeze(-1)
             # (3, k)
-            bji_tgt = weighted_tgt[bs, :, idx]
+            bji_tgt = torch.matmul(tgt[bs, :, :], perm_matrix_norm[bs, weights_col[bs, idx], :].transpose(1, 0).contiguous())
             bji_src = src[bs, :, weights_col[bs, idx]]
             # (k, 1)
             weights = weights_value[bs, idx].unsqueeze(-1)
@@ -392,10 +392,10 @@ class MatchNet(nn.Module):
         self.add_module('src_emb_nn_{}'.format(2), layer_2)
         self.head = SVDHead(args=args)
         self.tgt_attn = SelfAttentionalGNN(feature_dim=self.n_emb_dims)
-        for i in range(self.n_iters - 1):
+        for i in range(self.n_iters):
             attn = SelfAttentionalGNN(feature_dim=self.n_emb_dims)
             self.add_module('src_attn_{}'.format(i), attn)
-        self.share_attn = CrossAttentionalGNN(feature_dim=self.n_emb_dims)
+
     def forward(self, *input):
         src = input[0]
         tgt = input[1]
@@ -404,12 +404,9 @@ class MatchNet(nn.Module):
         tgt_embedding = self.tgt_emb_nn(tgt, i)
         src_emb_nn = getattr(self, 'src_emb_nn_{}'.format(i))
         src_embedding = src_emb_nn(src)
-        if i < 2:
-            src_attn = getattr(self, 'src_attn_{}'.format(i))
-            src_embedding = src_attn(src_embedding, src_embedding)
-            tgt_embedding = self.tgt_attn(tgt_embedding, tgt_embedding)
-        else:
-            src_embedding, tgt_embedding = self.share_attn(src_embedding, tgt_embedding)
+        src_attn = getattr(self, 'src_attn_{}'.format(i))
+        src_embedding = src_attn(src_embedding, src_embedding)
+        tgt_embedding = self.tgt_attn(tgt_embedding, tgt_embedding)
         rotation_ab, translation_ab, scores = self.head(src_embedding, tgt_embedding, src, tgt, temp)
         return rotation_ab, translation_ab, scores
 
