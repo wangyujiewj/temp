@@ -111,31 +111,6 @@ class Tar_DGCNN_0(nn.Module):
         output_0 = F.relu(self.out_bn0(self.out_conv0(output_0))).view(batch_size, -1, num_points)
         return output_0
 
-
-class Tar_DGCNN_1(nn.Module):
-    def __init__(self, emb_dims=512):
-        super(Tar_DGCNN_1, self).__init__()
-        self.conv1 = nn.Conv2d(6, 64, kernel_size=1, bias=False)
-        self.conv2 = nn.Conv2d(64, 64, kernel_size=1, bias=False)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.bn3 = nn.BatchNorm2d(128)
-        self.out_conv1 = nn.Conv2d(256, emb_dims, kernel_size=1, bias=False)
-        self.out_bn1 = nn.BatchNorm2d(emb_dims)
-    def forward(self, x, i):
-        batch_size, num_dims, num_points = x.size()
-        x = get_graph_feature(x)
-        x = F.relu(self.bn1(self.conv1(x)))
-        x1 = x.max(dim=-1, keepdim=True)[0]
-        x = F.relu(self.bn2(self.conv2(x)))
-        x2 = x.max(dim=-1, keepdim=True)[0]
-        x = F.relu(self.bn3(self.conv3(x)))
-        x3 = x.max(dim=-1, keepdim=True)[0]
-        output_1 = torch.cat((x1, x2, x3), dim=1)
-        output_1 = F.relu(self.out_bn1(self.out_conv1(output_1))).view(batch_size, -1, num_points)
-        return output_1
-
 class Src_DGCNN_0(nn.Module):
     def __init__(self, emb_dims=512):
         super(Src_DGCNN_0, self).__init__()
@@ -164,6 +139,30 @@ class Src_DGCNN_0(nn.Module):
         output_0 = torch.cat((x1, x2, x3, x4), dim=1)
         output_0 = F.relu(self.out_bn0(self.out_conv0(output_0))).view(batch_size, -1, num_points)
         return output_0
+
+class Tar_DGCNN_1(nn.Module):
+    def __init__(self, emb_dims=512):
+        super(Tar_DGCNN_1, self).__init__()
+        self.conv1 = nn.Conv2d(6, 64, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=1, bias=False)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.out_conv1 = nn.Conv2d(256, emb_dims, kernel_size=1, bias=False)
+        self.out_bn1 = nn.BatchNorm2d(emb_dims)
+    def forward(self, x, i):
+        batch_size, num_dims, num_points = x.size()
+        x = get_graph_feature(x)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x1 = x.max(dim=-1, keepdim=True)[0]
+        x = F.relu(self.bn2(self.conv2(x)))
+        x2 = x.max(dim=-1, keepdim=True)[0]
+        x = F.relu(self.bn3(self.conv3(x)))
+        x3 = x.max(dim=-1, keepdim=True)[0]
+        output_1 = torch.cat((x1, x2, x3), dim=1)
+        output_1 = F.relu(self.out_bn1(self.out_conv1(output_1))).view(batch_size, -1, num_points)
+        return output_1
 
 class Src_DGCNN_1(nn.Module):
     def __init__(self, emb_dims=512):
@@ -450,15 +449,17 @@ class HMNet(nn.Module):
         batch_size = src.size(0)
         identity = torch.eye(3, device=src.device).unsqueeze(0).repeat(batch_size, 1, 1)
         temp = torch.tensor(temp).cuda().repeat(batch_size)
-        rotation_ab_pred, translation_ab_pred, scores = self.forward(src, tgt, temp)
+        rotation_ab_pred = torch.eye(3, device=src.device, dtype=torch.float32).view(1, 3, 3).repeat(batch_size, 1, 1)
+        translation_ab_pred = torch.zeros(3, device=src.device, dtype=torch.float32).view(1, 3).repeat(batch_size, 1)
+        rotation_ab_pred_i, translation_ab_pred_i, scores = self.forward(src, tgt, temp)
         # 残差位姿
         res_rotation_ab = torch.matmul(rotation_ab, rotation_ab_pred.transpose(2, 1))
         res_translation_ab = translation_ab - torch.matmul(res_rotation_ab,
                                                                translation_ab_pred.unsqueeze(2)).squeeze(2)
         # 熵值loss
         entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
-        pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
-                         + F.mse_loss(translation_ab_pred, translation_ab))
+        pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred_i.transpose(2, 1), rotation_ab), identity)\
+                         + F.mse_loss(translation_ab_pred_i, translation_ab))
         loss = entropy_loss + pose_loss
         loss.backward()
         opt.step()
@@ -472,15 +473,15 @@ class HMNet(nn.Module):
         total_loss = 0
         temp = torch.tensor(temp).cuda().repeat(batch_size)
 
-        rotation_ab_pred, translation_ab_pred, scores = self.forward(src, tgt, temp)
+        rotation_ab_pred_i, translation_ab_pred_i, scores = self.forward(src, tgt, temp)
         # 残差位姿
         res_rotation_ab = torch.matmul(rotation_ab, rotation_ab_pred.transpose(2, 1))
         res_translation_ab = translation_ab - torch.matmul(res_rotation_ab,
                                                            translation_ab_pred.unsqueeze(2)).squeeze(2)
         # 熵值loss
         entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
-        pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
-                     + F.mse_loss(translation_ab_pred, translation_ab))
+        pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred_i.transpose(2, 1), rotation_ab), identity)\
+                     + F.mse_loss(translation_ab_pred_i, translation_ab))
         loss = entropy_loss + pose_loss
         return loss.item(), rotation_ab_pred, translation_ab_pred
 
