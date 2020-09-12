@@ -53,9 +53,9 @@ def get_graph_feature(x, idx=None, k=20, bool_GAPNet=False):
     feature = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2)
     return feature
 
-class GACLayer(nn.Module):
+class GACLayers(nn.Module):
     def __init__(self, in_channels, out_channels):
-        super(GACLayer, self).__init__()
+        super(GACLayers, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.conv2 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
@@ -83,30 +83,21 @@ class GACLayer(nn.Module):
 
         return output
 
-class Tar_DGCNN(nn.Module):
+class Tar_DGCNN_0(nn.Module):
     def __init__(self, emb_dims=512):
-        super(Tar_DGCNN, self).__init__()
+        super(Tar_DGCNN_0, self).__init__()
         self.conv1 = nn.Conv2d(6, 64, kernel_size=1, bias=False)
         self.conv2 = nn.Conv2d(64, 64, kernel_size=1, bias=False)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
         self.conv4 = nn.Conv2d(128, 256, kernel_size=1, bias=False)
-        self.gac = GACLayer(6, emb_dims//2)
         self.bn1 = nn.BatchNorm2d(64)
         self.bn2 = nn.BatchNorm2d(64)
         self.bn3 = nn.BatchNorm2d(128)
         self.bn4 = nn.BatchNorm2d(256)
-        self.out_conv2 = nn.Conv1d(192, emb_dims, kernel_size=1, bias=False)
-        self.out_bn2 = nn.BatchNorm1d(emb_dims)
-        self.out_conv1 = nn.Conv2d(256, emb_dims, kernel_size=1, bias=False)
-        self.out_bn1 = nn.BatchNorm2d(emb_dims)
         self.out_conv0 = nn.Conv2d(512, emb_dims, kernel_size=1, bias=False)
         self.out_bn0 = nn.BatchNorm2d(emb_dims)
-
-    def forward(self, x, i):
+    def forward(self, x):
         batch_size, num_dims, num_points = x.size()
-        # fine-tune relative pose
-        if i == 2:
-            return self.gac(x)
         x = get_graph_feature(x)
         x = F.relu(self.bn1(self.conv1(x)))
         x1 = x.max(dim=-1, keepdim=True)[0]
@@ -114,15 +105,36 @@ class Tar_DGCNN(nn.Module):
         x2 = x.max(dim=-1, keepdim=True)[0]
         x = F.relu(self.bn3(self.conv3(x)))
         x3 = x.max(dim=-1, keepdim=True)[0]
-        if i == 1:
-            output_1 = torch.cat((x1, x2, x3), dim=1)
-            output_1 = F.relu(self.out_bn1(self.out_conv1(output_1))).view(batch_size, -1, num_points)
-            return output_1
         x = F.relu(self.bn4(self.conv4(x)))
         x4 = x.max(dim=-1, keepdim=True)[0]
         output_0 = torch.cat((x1, x2, x3, x4), dim=1)
         output_0 = F.relu(self.out_bn0(self.out_conv0(output_0))).view(batch_size, -1, num_points)
         return output_0
+
+
+class Tar_DGCNN_1(nn.Module):
+    def __init__(self, emb_dims=512):
+        super(Tar_DGCNN_1, self).__init__()
+        self.conv1 = nn.Conv2d(6, 64, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=1, bias=False)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.out_conv1 = nn.Conv2d(256, emb_dims, kernel_size=1, bias=False)
+        self.out_bn1 = nn.BatchNorm2d(emb_dims)
+    def forward(self, x, i):
+        batch_size, num_dims, num_points = x.size()
+        x = get_graph_feature(x)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x1 = x.max(dim=-1, keepdim=True)[0]
+        x = F.relu(self.bn2(self.conv2(x)))
+        x2 = x.max(dim=-1, keepdim=True)[0]
+        x = F.relu(self.bn3(self.conv3(x)))
+        x3 = x.max(dim=-1, keepdim=True)[0]
+        output_1 = torch.cat((x1, x2, x3), dim=1)
+        output_1 = F.relu(self.out_bn1(self.out_conv1(output_1))).view(batch_size, -1, num_points)
+        return output_1
 
 class Src_DGCNN_0(nn.Module):
     def __init__(self, emb_dims=512):
@@ -177,22 +189,6 @@ class Src_DGCNN_1(nn.Module):
         output_1 = torch.cat((x1, x2, x3), dim=1)
         output_1 = F.relu(self.out_bn1(self.out_conv1(output_1))).view(batch_size, -1, num_points)
         return output_1
-
-# class Src_DGCNN_2(nn.Module):
-#     def __init__(self, emb_dims=512):
-#         super(Src_DGCNN_2, self).__init__()
-#         self.gac0 = GACLayer(6, 64)
-#         self.gac1 = GACLayer(128, 128)
-#         self.out_conv2 = nn.Conv1d(192, emb_dims, kernel_size=1, bias=False)
-#         self.out_bn2 = nn.BatchNorm1d(emb_dims)
-#
-#     def forward(self, x):
-#         batch_size, num_dims, num_points = x.size()
-#         x1 = self.gac0(x)
-#         x2 = self.gac1(x1)
-#         output_2 = torch.cat((x1, x2), dim=1)
-#         output_2 = F.relu(self.out_bn2(self.out_conv2(output_2))).view(batch_size, -1, num_points)
-#         return output_2
 
 def attention(query, key, value):
     dim = query.shape[1]
@@ -285,7 +281,6 @@ class SVDHead(nn.Module):
         # (bs, k, np)
         scores = scores[:, :-1, :-1]
         return scores
-
     def forward(self, *input):
         src_embedding = input[0]
         tgt_embedding = input[1]
@@ -333,59 +328,99 @@ class SVDHead(nn.Module):
         t = torch.matmul(-R, src_centroid) + tgt_centroid
         return R, t.view(batch_size, 3), perm_matrix_norm
 
-class MatchNet(nn.Module):
+class MatchNet_0(nn.Module):
     def __init__(self, args):
-        super(MatchNet, self).__init__()
+        super(MatchNet_0, self).__init__()
+        self.n_emb_dims = args.n_emb_dims
+        self.num_keypoints = args.n_keypoints
+        self.num_subsampled_points = args.n_subsampled_points
+        self.tgt_emb_nn = Tar_DGCNN_0(emb_dims=self.n_emb_dims)
+        self.src_emb_nn = Src_DGCNN_0(emb_dims=self.n_emb_dims)
+        self.src_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
+        self.tgt_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
+        self.head = SVDHead(args=args)
+    def forward(self, *input):
+        src = input[0]
+        tgt = input[1]
+        temp = input[2]
+        tgt_embedding = self.tgt_emb_nn(tgt)
+        src_embedding = self.src_emb_nn(src)
+        src_embedding = self.src_attn(src_embedding, src_embedding)
+        tgt_embedding = self.tgt_attn(tgt_embedding, tgt_embedding)
+        rotation_ab, translation_ab, scores = self.head(src_embedding, tgt_embedding, src, tgt, temp)
+        return rotation_ab, translation_ab, scores
+
+class MatchNet_1(nn.Module):
+    def __init__(self, args):
+        super(MatchNet_1, self).__init__()
+        self.match_net_0 = MatchNet_0(args)
+        self.model_path = 'checkpoints/%s/models/model.best.t7' % args.exp_name
+        self.match_net_0.load_state_dict(torch.load(self.model_path))
+        print("loading successful!")
+        for p in self.parameters():
+            p.requires_grad = False
         self.n_emb_dims = args.n_emb_dims
         self.num_keypoints = args.n_keypoints
         self.num_subsampled_points = args.n_subsampled_points
         self.n_iters = args.n_iters
-        self.tgt_emb_nn = Tar_DGCNN(emb_dims=self.n_emb_dims)
-        layer_0 = Src_DGCNN_0(emb_dims=self.n_emb_dims)
-        layer_1 = Src_DGCNN_1(emb_dims=self.n_emb_dims)
-        layer_2 = GACLayer(in_channels=6, out_channels=self.n_emb_dims // 2)
-        self.add_module('src_emb_nn_{}'.format(0), layer_0)
-        self.add_module('src_emb_nn_{}'.format(1), layer_1)
-        self.add_module('src_emb_nn_{}'.format(2), layer_2)
+        self.tgt_emb_nn = Tar_DGCNN_1(emb_dims=self.n_emb_dims)
+        self.src_emb_nn = Src_DGCNN_1(emb_dims=self.n_emb_dims)
+        self.src_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
+        self.tgt_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
         self.head = SVDHead(args=args)
-        for i in range(self.n_iters):
-            if i == self.n_iters - 1:
-                src_attn = AttentionalGNN(feature_dim=self.n_emb_dims // 2)
-                self.add_module('src_attn_{}'.format(i), src_attn)
-                tgt_attn = AttentionalGNN(feature_dim=self.n_emb_dims // 2)
-                self.add_module('tgt_attn_{}'.format(i), tgt_attn)
-            else:
-                src_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
-                self.add_module('src_attn_{}'.format(i), src_attn)
-                tgt_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
-                self.add_module('tgt_attn_{}'.format(i), tgt_attn)
-        # self.share_attn = AttentionalGNN(feature_dim=self.n_emb_dims)
+    def forward(self, *input):
+        src = input[0]
+        tgt = input[1]
+        temp = input[2]
+        rotation_ab, translation_ab, scores = self.match_net_0(src, tgt, temp)
+        src = transform_point_cloud(src, rotation_ab, translation_ab)
+        tgt_embedding = self.tgt_emb_nn(tgt)
+        src_embedding = self.src_emb_nn(src)
+        src_embedding = self.src_attn(src_embedding, src_embedding)
+        tgt_embedding = self.tgt_attn(tgt_embedding, tgt_embedding)
+        rotation_ab, translation_ab, scores = self.head(src_embedding, tgt_embedding, src, tgt, temp)
+        return rotation_ab, translation_ab, scores
+
+class MatchNet_2(nn.Module):
+    def __init__(self, args):
+        super(MatchNet_2, self).__init__()
+        self.match_net_1 = MatchNet_1(args)
+        self.model_path = args.model_path
+        self.model_path = 'checkpoints/%s/models/model.best.t7' % args.exp_name
+        self.match_net_1.load_state_dict(torch.load(self.model_path))
+        print("loading successful!")
+        for p in self.parameters():
+            p.requires_grad = False
+        self.n_emb_dims = args.n_emb_dims
+        self.num_keypoints = args.n_keypoints
+        self.num_subsampled_points = args.n_subsampled_points
+        self.n_iters = args.n_iters
+        self.tgt_emb_nn = GACLayers(in_channels=6, out_channels=self.n_emb_dims // 2)
+        self.src_emb_nn = GACLayers(in_channels=6, out_channels=self.n_emb_dims // 2)
+        self.share_attn = AttentionalGNN(feature_dim=self.n_emb_dims // 2)
+        self.head = SVDHead(args=args)
 
     def forward(self, *input):
         src = input[0]
         tgt = input[1]
         temp = input[2]
-        i = input[3]
-        tgt_embedding = self.tgt_emb_nn(tgt, i)
-        src_emb_nn = getattr(self, 'src_emb_nn_{}'.format(i))
-        src_embedding = src_emb_nn(src)
-        src_attn = getattr(self, 'src_attn_{}'.format(i))
-        tgt_attn = getattr(self, 'tgt_attn_{}'.format(i))
-        src_embedding = src_attn(src_embedding, src_embedding)
-        tgt_embedding = tgt_attn(tgt_embedding, tgt_embedding)
+        rotation_ab, translation_ab, scores = self.match_net_1(src, tgt, temp)
+        src = transform_point_cloud(src, rotation_ab, translation_ab)
+        # fine-tuning
+        tgt_embedding = self.tgt_emb_nn(tgt)
+        src_embedding = self.src_emb_nn(src)
+        src_embedding, tgt_embedding = self.share_attn(src_embedding, tgt_embedding, cross=True)
         rotation_ab, translation_ab, scores = self.head(src_embedding, tgt_embedding, src, tgt, temp)
         return rotation_ab, translation_ab, scores
 
 class HMNet(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args, model):
         super(HMNet, self).__init__()
         self.num_iters = args.n_iters
         self.logger = Logger(args)
-        self.match_net = MatchNet(args)
+        self.match_net = model
         self.model_path = args.model_path
         self.discount_factor = args.discount_factor
-        if self.model_path is not '':
-            self.load(self.model_path)
         if torch.cuda.device_count() > 1:
             self.match_net = nn.DataParallel(self.match_net)
 
@@ -414,29 +449,20 @@ class HMNet(nn.Module):
         opt.zero_grad()
         batch_size = src.size(0)
         identity = torch.eye(3, device=src.device).unsqueeze(0).repeat(batch_size, 1, 1)
-        rotation_ab_pred = torch.eye(3, device=src.device, dtype=torch.float32).view(1, 3, 3).repeat(batch_size, 1, 1)
-        translation_ab_pred = torch.zeros(3, device=src.device, dtype=torch.float32).view(1, 3).repeat(batch_size, 1)
-        total_loss = 0
         temp = torch.tensor(temp).cuda().repeat(batch_size)
-        for i in range(self.num_iters):
-            rotation_ab_pred_i, translation_ab_pred_i, scores = self.forward(src, tgt, temp, i)
-            # 残差位姿
-            res_rotation_ab = torch.matmul(rotation_ab, rotation_ab_pred.transpose(2, 1))
-            res_translation_ab = translation_ab - torch.matmul(res_rotation_ab,
+        rotation_ab_pred, translation_ab_pred, scores = self.forward(src, tgt, temp)
+        # 残差位姿
+        res_rotation_ab = torch.matmul(rotation_ab, rotation_ab_pred.transpose(2, 1))
+        res_translation_ab = translation_ab - torch.matmul(res_rotation_ab,
                                                                translation_ab_pred.unsqueeze(2)).squeeze(2)
-            # 累计位姿
-            rotation_ab_pred = torch.matmul(rotation_ab_pred_i, rotation_ab_pred)
-            translation_ab_pred = torch.matmul(rotation_ab_pred_i, translation_ab_pred.unsqueeze(2)).squeeze(2) \
-                                  + translation_ab_pred_i
-            # 熵值loss
-            entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
-            pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
+        # 熵值loss
+        entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
+        pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
                          + F.mse_loss(translation_ab_pred, translation_ab))
-            total_loss = total_loss + entropy_loss + pose_loss
-            src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
-        total_loss.backward()
+        loss = entropy_loss + pose_loss
+        loss.backward()
         opt.step()
-        return total_loss.item(), rotation_ab_pred, translation_ab_pred
+        return loss.item(), rotation_ab_pred, translation_ab_pred
 
     def _test_one_batch(self, src, tgt, rotation_ab, translation_ab, temp):
         batch_size = src.size(0)
@@ -445,23 +471,18 @@ class HMNet(nn.Module):
         translation_ab_pred = torch.zeros(3, device=src.device, dtype=torch.float32).view(1, 3).repeat(batch_size, 1)
         total_loss = 0
         temp = torch.tensor(temp).cuda().repeat(batch_size)
-        for i in range(self.num_iters):
-            rotation_ab_pred_i, translation_ab_pred_i, scores = self.forward(src, tgt, temp, i)
-            # 残差位姿
-            res_rotation_ab = torch.matmul(rotation_ab, rotation_ab_pred.transpose(2, 1))
-            res_translation_ab = translation_ab - torch.matmul(res_rotation_ab,
-                                                               translation_ab_pred.unsqueeze(2)).squeeze(2)
-            # 累计位姿
-            rotation_ab_pred = torch.matmul(rotation_ab_pred_i, rotation_ab_pred)
-            translation_ab_pred = torch.matmul(rotation_ab_pred_i, translation_ab_pred.unsqueeze(2)).squeeze(2) \
-                                  + translation_ab_pred_i
-            # 熵值loss
-            entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
-            pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
-                         + F.mse_loss(translation_ab_pred, translation_ab))
-            total_loss = total_loss + entropy_loss + pose_loss
-            src = transform_point_cloud(src, rotation_ab_pred_i, translation_ab_pred_i)
-        return total_loss.item(), rotation_ab_pred, translation_ab_pred
+
+        rotation_ab_pred, translation_ab_pred, scores = self.forward(src, tgt, temp)
+        # 残差位姿
+        res_rotation_ab = torch.matmul(rotation_ab, rotation_ab_pred.transpose(2, 1))
+        res_translation_ab = translation_ab - torch.matmul(res_rotation_ab,
+                                                           translation_ab_pred.unsqueeze(2)).squeeze(2)
+        # 熵值loss
+        entropy_loss = self.compute_loss(scores, src, res_rotation_ab, res_translation_ab, tgt)
+        pose_loss = (F.mse_loss(torch.matmul(rotation_ab_pred.transpose(2, 1), rotation_ab), identity)\
+                     + F.mse_loss(translation_ab_pred, translation_ab))
+        loss = entropy_loss + pose_loss
+        return loss.item(), rotation_ab_pred, translation_ab_pred
 
     def _train_one_epoch(self, epoch, train_loader, opt, temp):
         self.train()
@@ -472,12 +493,6 @@ class HMNet(nn.Module):
         translations_ab_pred = []
         eulers_ab = []
         num_examples = 0
-        if epoch < 15:
-            self.num_iters = 1
-        elif epoch >=15 and epoch < 30:
-            self.num_iters = 2
-        else:
-            self.num_iters = 3
         for data in tqdm(train_loader):
             src, tgt, rotation_ab, translation_ab, rotation_ba, translation_ba, euler_ab, euler_ba = [d.cuda()
                                                                                                       for d in data]
@@ -537,12 +552,6 @@ class HMNet(nn.Module):
         translations_ab_pred = []
         eulers_ab = []
         num_examples = 0
-        if epoch < 15:
-            self.num_iters = 1
-        elif epoch >= 15 and epoch < 30:
-            self.num_iters = 2
-        else:
-            self.num_iters = 3
         for data in tqdm(test_loader):
             src, tgt, rotation_ab, translation_ab, rotation_ba, translation_ba, euler_ab, euler_ba = [d.cuda()
                                                                                                       for d in data]
