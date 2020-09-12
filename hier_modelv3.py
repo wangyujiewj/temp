@@ -151,7 +151,7 @@ class Tar_DGCNN_1(nn.Module):
         self.bn3 = nn.BatchNorm2d(128)
         self.out_conv1 = nn.Conv2d(256, emb_dims, kernel_size=1, bias=False)
         self.out_bn1 = nn.BatchNorm2d(emb_dims)
-    def forward(self, x, i):
+    def forward(self, x):
         batch_size, num_dims, num_points = x.size()
         x = get_graph_feature(x)
         x = F.relu(self.bn1(self.conv1(x)))
